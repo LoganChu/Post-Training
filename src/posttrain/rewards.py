@@ -5,8 +5,9 @@ Two completion shapes, selected explicitly with `think`:
   ends with "<think>\\n", so a completion looks like "reasoning ... </think>\\n\\nanswer \\boxed{..}".
   A completion without </think> never finished reasoning (e.g. truncated) and gets no credit,
   even if a \\boxed{} appears mid-reasoning.
-- think=False (RL-Zero track, plain-text prompt on the Base model): no think tags; the answer is
-  the \\boxed{} in the text. Several boxed answers parse as a set and never match (anti-hedging).
+- think=False (RL-Zero track, plain-text prompt on the Base model): the answer is the \\boxed{} in
+  the text, after the think block if the model chose to write one.
+Several boxed answers parse as a set and never match (anti-hedging).
 
 GRPOTrainer calls reward functions with `completions` (strings, or lists of one message dict for
 conversational datasets), `completion_ids`, and every extra dataset column as a keyword argument;
@@ -51,15 +52,20 @@ def answer_region(text: str, think: bool) -> str | None:
     """The part of a completion that should hold the final answer, or None if it has none.
 
     think=True:  text after exactly one </think>; None if reasoning never closed or tags repeat.
-    think=False: the whole text; None if the model emitted think tags anyway.
+    think=False: the whole text, or, if the model opened a think block on its own (Qwen3.5-Base
+                 does this ~10% of the time), the text after a single well-formed
+                 <think>...</think> pair. Unclosed/repeated tags -> None.
     """
+    n_open, n_close = text.count(THINK_OPEN), text.count(THINK_CLOSE)
     if think:
-        if text.count(THINK_CLOSE) != 1 or THINK_OPEN in text:
+        if n_close != 1 or n_open != 0:
             return None
         return text.split(THINK_CLOSE, 1)[1]
-    if THINK_OPEN in text or THINK_CLOSE in text:
-        return None
-    return text
+    if n_open == 0 and n_close == 0:
+        return text
+    if n_open == 1 and n_close == 1 and text.index(THINK_OPEN) < text.index(THINK_CLOSE):
+        return text.split(THINK_CLOSE, 1)[1]
+    return None
 
 
 def _timeouts() -> tuple[int | None, int | None]:
@@ -116,5 +122,5 @@ def format_reward(completions: list, **kwargs) -> list[float]:
 
 
 def format_reward_zero(completions: list, **kwargs) -> list[float]:
-    """RL-Zero track: 1.0 if there is a \\boxed{} answer and no think tags."""
+    """RL-Zero track: 1.0 if there is a \\boxed{} answer and any think block is well-formed."""
     return _format(completions, think=False)

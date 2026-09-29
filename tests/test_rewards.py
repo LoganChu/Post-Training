@@ -79,8 +79,19 @@ def test_zero_track_plain_text():
     assert format_reward_zero(["so 34"]) == [0.0]
 
 
-def test_zero_track_rejects_think_tags():
-    assert correctness_reward_zero([think("w", r"\boxed{34}")], solution=["34"]) == [0.0]
+def test_zero_track_accepts_self_opened_think_block():
+    # Qwen3.5-Base sometimes opens a think block on its own; the answer follows it
+    c = "<think>\n" + think("w", r"\boxed{34}")
+    assert correctness_reward_zero([c], solution=["34"]) == [1.0]
+    assert format_reward_zero([c]) == [1.0]
+
+
+def test_zero_track_rejects_malformed_think_tags():
+    unclosed = r"<think> maybe \boxed{34}"
+    close_without_open = think("w", r"\boxed{34}")
+    reversed_tags = r"</think> a <think> \boxed{34}"
+    for c in [unclosed, close_without_open, reversed_tags]:
+        assert correctness_reward_zero([c], solution=["34"]) == [0.0]
 
 
 # --- trainer-facing shapes ---
