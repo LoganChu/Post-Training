@@ -1,0 +1,35 @@
+[project]
+name = "posttrain"
+version = "0.1.0"
+description = "Math-reasoning post-training experiments (SFT -> on-policy distillation -> RLVR) with TRL on Qwen3.5"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # vLLM pins the torch version; PyPI torch wheels ship CUDA runtimes with Blackwell (sm_120) support.
+    "vllm==0.30.0",
+    "trl[vllm,peft,liger,math-verify,quantization]==1.14.0",
+    "transformers>=5.17.0",
+    "peft>=0.21.0",
+    "accelerate>=1.15.0",
+    "datasets>=5.0.1",
+    "flash-linear-attention>=0.5.2",  # Triton Gated DeltaNet kernels for Qwen3.5
+    "math-verify>=0.9.0",
+    "wandb>=0.30.0",
+    "pyarrow",
+    "kernels>=0.16.0,<0.17",  # HF Hub prebuilt kernels (causal_conv1d without nvcc); range required by transformers
+]
+
+[project.optional-dependencies]
+# Source-only on PyPI; needs nvcc unless a prebuilt wheel matches torch/CUDA.
+# Without it, only the short conv in DeltaNet layers falls back to PyTorch.
+kernels = ["causal-conv1d>=1.7.0"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["uv_build>=0.12,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv]
+no-build-isolation-package = ["causal-conv1d"]
