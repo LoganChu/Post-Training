@@ -62,7 +62,8 @@ def load_problems(bench: Benchmark, seed: int) -> list[dict]:
             random.Random(seed + i).shuffle(options)
             letters = "ABCD"
             problem += "\n\n" + "\n".join(f"{letters[j]}. {str(o).strip()}" for j, o in enumerate(options))
-            problem += "\n\nAnswer with the letter of the correct option."
+            # Must agree with the prompt templates' \boxed{} instruction, or models answer with a bare letter.
+            problem += "\n\nGive the letter of the correct option (A, B, C, or D) as your final answer within \\boxed{}."
             answer = letters[options.index(answer)]
         rows.append({"problem": problem, "answer": answer})
     return rows
@@ -75,6 +76,55 @@ def grade(text: str, gold: str, kind: str, mode: Mode) -> bool:
         found = re.findall(r"\\boxed\{\s*(?:\\text\{)?\s*([A-D])\b", region or "")
         return len(set(found)) == 1 and found[0] == gold
     return bool(is_correct(text, gold, think=think))
+
+
+def sampling_info(args: argparse.Namespace) -> dict:
+    return {k: getattr(args, k) for k in ["temperature", "top_p", "top_k", "presence_penalty", "seed"]}
+
+
+def grade_records(records: list[dict], kind: str, mode: Mode) -> None:
+    """(Re)compute the `correct` and `well_formed` fields of saved samples in place."""
+    for r in records:
+        r["correct"] = grade(r["completion"], r["gold"], kind, mode)
+        region = answer_region(r["completion"], mode == "think")
+        r["well_formed"] = region is not None and "\\boxed{" in region
+
+
+def summarize(records: list[dict], k: int, gen_seconds: float | None = None) -> dict:
+    """Benchmark metrics from graded samples (stored as k consecutive samples per problem)."""
+    n = len(records)
+    per_problem = [records[i : i + k] for i in range(0, n, k)]
+    return {
+        "num_problems": len(per_problem),
+        "k": k,
+        "avg@k": sum(r["correct"] for r in records) / n,
+        "pass@k": sum(any(r["correct"] for r in group) for group in per_problem) / len(per_problem),
+        "format": sum(r["well_formed"] for r in records) / n,
+        "truncated": sum(r["truncated"] for r in records) / n,
+        "mean_tokens": sum(r["num_tokens"] for r in records) / n,
+        "gen_seconds": gen_seconds,
+    }
+
+
+def regrade(args: argparse.Namespace) -> dict:
+    """Re-grade saved samples with the current grader and rebuild summary.json; no generation."""
+    out_dir = Path(args.output_dir)
+    summary_path = out_dir / "summary.json"
+    old = json.loads(summary_path.read_text())["benchmarks"] if summary_path.exists() else {}
+    summary = {"model": args.model, "mode": args.mode, "max_tokens": args.max_tokens, "sampling": sampling_info(args), "benchmarks": {}}
+    for path in sorted(out_dir.glob("*.jsonl")):
+        name = path.stem
+        records = [json.loads(line) for line in path.open()]
+        num_problems = len(dict.fromkeys(r["problem"] for r in records))
+        grade_records(records, BENCHMARKS[name].kind, args.mode)
+        result = summarize(records, len(records) // num_problems, old.get(name, {}).get("gen_seconds"))
+        summary["benchmarks"][name] = result
+        with open(path, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+    summary_path.write_text(json.dumps(summary, indent=2))
+    print_table(summary)
+    return summary
 
 
 def evaluate(args: argparse.Namespace) -> dict:
@@ -92,7 +142,11 @@ def evaluate(args: argparse.Namespace) -> dict:
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    summary = {"model": args.model, "mode": args.mode, "max_tokens": args.max_tokens, "benchmarks": {}}
+    # Merge into an existing summary so a subset of benchmarks can be re-run without losing the rest.
+    summary_path = out_dir / "summary.json"
+    summary = {"model": args.model, "mode": args.mode, "max_tokens": args.max_tokens, "sampling": sampling_info(args), "benchmarks": {}}
+    if summary_path.exists():
+        summary["benchmarks"] = json.loads(summary_path.read_text())["benchmarks"]
     for name in args.benchmarks.split(","):
         bench = BENCHMARKS[name]
         try:
@@ -108,6 +162,7 @@ def evaluate(args: argparse.Namespace) -> dict:
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
+            presence_penalty=args.presence_penalty,
             max_tokens=args.max_tokens,
             stop=STOP_STRINGS[args.mode],
             seed=args.seed,
@@ -115,59 +170,57 @@ def evaluate(args: argparse.Namespace) -> dict:
         prompts = [render_prompt(p["problem"], args.mode, tokenizer) for p in problems]
         t0 = time.time()
         outputs = llm.generate(prompts, params)
-        gen_time = time.time() - t0
 
-        records, per_problem = [], []
+        records = []
         for prob, prompt, out in zip(problems, prompts, outputs, strict=True):
-            correct = []
             for s in out.outputs:
-                ok = grade(s.text, prob["answer"], bench.kind, args.mode)
-                correct.append(ok)
                 records.append(
                     {
                         "problem": prob["problem"],
                         "gold": prob["answer"],
                         "prompt": prompt,
                         "completion": s.text,
-                        "correct": ok,
                         "num_tokens": len(s.token_ids),
                         "truncated": s.finish_reason == "length",
-                        "well_formed": (r := answer_region(s.text, args.mode == "think")) is not None and "\\boxed{" in r,
                     }
                 )
-            per_problem.append(correct)
-
-        n = len(records)
-        result = {
-            "num_problems": len(problems),
-            "k": k,
-            "avg@k": sum(r["correct"] for r in records) / n,
-            "pass@k": sum(any(c) for c in per_problem) / len(per_problem),
-            "format": sum(r["well_formed"] for r in records) / n,
-            "truncated": sum(r["truncated"] for r in records) / n,
-            "mean_tokens": sum(r["num_tokens"] for r in records) / n,
-            "gen_seconds": round(gen_time, 1),
-        }
+        grade_records(records, bench.kind, args.mode)
+        result = summarize(records, k, gen_seconds=round(time.time() - t0, 1))
         summary["benchmarks"][name] = result
         with open(out_dir / f"{name}.jsonl", "w") as f:
             for r in records:
                 f.write(json.dumps(r) + "\n")
         print(f"[{name}] " + "  ".join(f"{key}={v:.3f}" if isinstance(v, float) else f"{key}={v}" for key, v in result.items()))
 
-    with open(out_dir / "summary.json", "w") as f:
+    with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     print_table(summary)
     return summary
 
 
 def print_table(summary: dict) -> None:
-    print(f"\nmodel={summary['model']}  mode={summary['mode']}  max_tokens={summary['max_tokens']}")
+    print(f"\nmodel={summary['model']}  mode={summary['mode']}  max_tokens={summary['max_tokens']}  sampling={summary.get('sampling')}")
     print(f"{'benchmark':10s} {'k':>3s} {'avg@k':>7s} {'pass@k':>7s} {'format':>7s} {'trunc':>7s} {'tokens':>7s}")
     for name, r in summary["benchmarks"].items():
         print(
             f"{name:10s} {r['k']:3d} {r['avg@k']:7.1%} {r['pass@k']:7.1%} {r['format']:7.1%} "
             f"{r['truncated']:7.1%} {r['mean_tokens']:7.0f}"
         )
+
+
+def _exit_now() -> None:
+    """vLLM's engine-core subprocess sometimes never exits at interpreter shutdown, hanging the run
+    after every result is already on disk. Kill it and leave instead of waiting forever."""
+    import os
+    import sys
+
+    import psutil
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    for child in psutil.Process().children(recursive=True):
+        child.kill()
+    os._exit(0)
 
 
 def main() -> None:
@@ -179,17 +232,28 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=None, help="only the first N problems (quick checks)")
     p.add_argument("--max-tokens", type=int, default=8192)
     p.add_argument("--max-prompt-tokens", type=int, default=1024)
-    # Common math-eval sampling (DeepSeek-R1 / Qwen3 reports): T=0.6, top_p=0.95, top_k=20.
+    # One protocol for every model. T=0.6/top_p=0.95/top_k=20 is the usual math-eval recipe
+    # (DeepSeek-R1, Qwen3 reports). presence_penalty=1.5 (Qwen3.5's thinking-mode recommendation)
+    # is needed because without it Qwen3.5 models fall into repetition loops (all 28 of the
+    # post-trained 2B's truncated MATH-500 samples in a 50-problem check; 42% -> 70% accuracy with
+    # the penalty). Ablation on MATH-500 subsets: at T=0.6 the penalty costs the base model nothing
+    # (40.3% vs 39.8%), while raising T to 1.0 drops it to 29% with or without the penalty.
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--presence-penalty", type=float, default=1.5)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-dir", default=None, help="default: outputs/eval/<model>-<mode>")
+    p.add_argument("--regrade", action="store_true", help="re-grade saved samples in --output-dir; no generation")
     args = p.parse_args()
     if args.output_dir is None:
         args.output_dir = f"outputs/eval/{args.model.rstrip('/').replace('/', '--')}-{args.mode}"
-    evaluate(args)
+    if args.regrade:
+        regrade(args)
+    else:
+        evaluate(args)
+        _exit_now()
 
 
 if __name__ == "__main__":
