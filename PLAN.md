@@ -1,7 +1,7 @@
 # Plan: SOTA math-reasoning post-training with TRL on one RTX 5090
 
-Status as of 2026-09-30 19:40. Steps 1-3 done (environment, rewards, eval harness); stage-0
-baselines re-running under the settled eval protocol; step 4 (RL-Zero) is next.
+Status as of 2026-10-01. Steps 1-3 done (environment, rewards, eval harness, all stage-0 baselines
+and the output-budget sweep; results in README.md). Step 4 (RL-Zero) is next.
 
 ## Context and decisions
 
@@ -37,7 +37,7 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 |---|---|---|
 | 1 | Environment: `pyproject.toml`, `scripts/check_env.py` | done |
 | 2 | Rewards: `src/posttrain/rewards.py` + tests | done |
-| 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | harness done; baselines re-running |
+| 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | done |
 | 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | next |
 | 5 | SFT data build (Nemotron) + SFT on 0.8B | todo |
 | 6 | On-policy distillation on 0.8B | todo |
@@ -129,56 +129,26 @@ Benchmarks: MATH-500 (k=4), AIME 2024/2025/2026 (k=16), AMC23 (k=8), GPQA-Diamon
 out-of-domain). Metrics: avg@k (headline), pass@k (RL headroom), format rate, truncation rate,
 mean tokens. Grading uses the same `is_correct` as the RL reward.
 
-### Stage-0 baselines (`scripts/run_baselines.sh`, running detached)
-The script is resumable: runs already complete under the current protocol are skipped, so after
-any interruption just start it again. Progress: `outputs/baselines.log`; full vLLM output:
-`outputs/baselines-full.log`.
-
-| # | model | mode | max_tokens | k | status | est. time |
-|---|---|---|---|---|---|---|
-| 1 | Qwen3.5-0.8B-Base | zero | 8192 | default | done: MATH-500 35.5%, AIME ~1%, AMC 16.9%, GPQA 17.8% | 25 min |
-| 2 | Qwen3.5-0.8B-Base | think | 8192 | default | running (restarted; previous run killed at 23:17 with the session) | 35 min |
-| 3 | Qwen3.5-2B-Base | zero | 8192 | default | queued | 30 min |
-| 4 | Qwen3.5-2B-Base | think | 8192 | default | queued | 40 min |
-| 5 | Qwen3.5-2B (post-trained ceiling) | think | 32768 | 1 (MATH-500, GPQA), 4 (AIME, AMC) | queued | ~2.5 h |
-
-Reduced k for the ceiling was chosen to keep it to ~2.5 h instead of 5-7 h; it is a reference
-point, not an optimization target. Expected completion around 00:15; follow-ups (below) until ~02:00.
-
-```
-grep -c '^model=' outputs/baselines.log   # finished runs (this log also holds earlier attempts)
-pgrep -af 'run_baselines.sh'              # still running?
-```
-
-If a process hangs at the end of a run (vLLM shutdown bug), kill `VLLM::EngineCore`; `eval.py`
-force-exits after writing results, so this should be rare. To re-score saved samples after a
-grader change without regenerating: `uv run -m posttrain.eval --model M --mode X --regrade`.
-
-### Queued follow-ups (`scripts/run_followups.sh`, starts automatically after run 5)
-Progress: `outputs/followups.log`. Resumable like the baselines.
-
-| # | what | output | est. time |
-|---|---|---|---|
-| 6 | Matched-budget ceiling: post-trained 2B at **8,192** tokens (k as run 5), the fair comparison for our 8k-budget models | `outputs/eval/Qwen--Qwen3.5-2B-think-8k` | ~30 min |
-| 7 | Budget sweep: 2B-Base think on AIME 2025 (k=16) + first 100 MATH-500 (k=4) at **16k** | `outputs/eval/budget-sweep/Qwen3.5-2B-Base-think-16384` | ~15 min |
-| 8 | Same at **32k** (8k point = matching subset of run 4) | `outputs/eval/budget-sweep/Qwen3.5-2B-Base-think-32768` | ~30 min |
-| 9 | 0.8B-Base think, same sweep at **16k** (8k point = subset of run 2) | `outputs/eval/budget-sweep/Qwen3.5-0.8B-Base-think-16384` | ~15 min |
-| 10 | 0.8B-Base think at **32k** | `outputs/eval/budget-sweep/Qwen3.5-0.8B-Base-think-32768` | ~25 min |
+### Stage-0 baselines and budget sweep (done 2026-10-01)
+Results tables: README.md. Raw samples: `outputs/eval/` (Base runs: default k; post-trained 2B:
+k=1 for MATH-500/GPQA, k=4 for AIME/AMC, at 32k and at 8k; budget sweep in
+`outputs/eval/budget-sweep/`). Scripts: `scripts/run_baselines.sh`, `scripts/run_followups.sh`
+(both resumable: runs already complete under the current protocol are skipped).
 
 Why the sweep: max output length is an eval choice, but the right value depends on how long a
-model needs to finish. If 2B-Base accuracy rises with budget, it can reason long but does not
-stop (SFT must teach finishing); if only truncation drops, 8k is a fair Base measurement. Main
-Base baselines stay at 8k either way, matching the SFT/RL training budget. The model card
-recommends 32,768 output tokens in general and 81,920 for competition-math benchmarking, but
-does not say which length produced its own benchmark tables.
+model needs to finish. The Base baselines stay at 8k to match the SFT/RL training budget. The
+model card recommends 32,768 output tokens in general and 81,920 for competition-math
+benchmarking, but does not say which length produced its own benchmark tables.
 
-### Other ceiling follow-ups (decide after run 5)
+If an eval process hangs at the end (vLLM shutdown bug), kill `VLLM::EngineCore`. To re-score
+saved samples after a grader change: `uv run -m posttrain.eval --model M --mode X --regrade`.
+
+### Open ceiling follow-ups (optional)
 - **Official sampling.** The card's T=1.0 scored 72% vs 70% at our protocol on a 50-problem
-  check (within noise). If run 5 lands well below Qwen's reported numbers, rerun at T=1.0 into
-  `outputs/eval/Qwen--Qwen3.5-2B-think-official` and report both.
-- **Larger budget.** The card recommends 81,920 output tokens for math; at 32k about a quarter of
-  ceiling samples truncate on genuine long reasoning. Only worth it if the ceiling is the number
-  being reported against.
+  check (within noise); rerun at T=1.0 into `outputs/eval/Qwen--Qwen3.5-2B-think-official` only
+  if reporting against Qwen's published numbers.
+- **81,920-token budget.** At 32k, 82-88% of the post-trained 2B's AIME samples still truncate.
+  Only worth it if the ceiling is the number being reported against.
 
 ### Per-stage evals (same protocol and benchmarks, compared line-for-line with the baselines)
 
@@ -187,7 +157,7 @@ does not say which length produced its own benchmark tables.
 | RL-Zero | `outputs/rlzero-0.8b`, `outputs/rlzero-2b` | zero | 8192 | Base zero (rows 1, 3) |
 | SFT | `outputs/sft-0.8b`, `outputs/sft-2b` | think | 8192 (raise if truncation > 30%) | Base think (rows 2, 4) |
 | SFT + distill | `outputs/distill-0.8b`, `outputs/distill-2b` | think | 8192-16384 | SFT rows |
-| SFT + distill + RL | `outputs/rl-0.8b`, `outputs/rl-2b` | think | 8192-16384 | distill rows and ceiling (row 5) |
+| SFT + distill + RL | `outputs/rl-0.8b`, `outputs/rl-2b` | think | 8192-16384 | distill rows and post-trained 2B at the same budget |
 | +DPO ablation | `outputs/dpo-rl-0.8b` | think | same as RL | RL row |
 
 ```
@@ -208,11 +178,18 @@ uv run -m posttrain.eval --model outputs/<checkpoint> --mode think --benchmarks 
   (truncated guesses get 0); multiple `\boxed{}` answers parse as a set and never match
   (anti-hedging); gold answers are wrapped in `\boxed{}` before parsing (bare LaTeX like
   `(x+1)^2` otherwise fails silently and the row is dropped).
-- **The Base model already reasons.** 2B-Base: 60% MATH-500 (pass@4 81%) with no post-training;
-  in think mode it does not know when to stop (84-90% truncation on AIME at 8k). Learning to
-  finish is a large part of what SFT must teach.
+- **The Base models already reason, but do not stop.** 2B-Base: 61% MATH-500 in zero mode, 72%
+  in think mode, with no post-training. In think mode both sizes truncate on 80-90% of AIME at 8k
+  (zero mode: ~40-47%): the `<think>` block starts long reasoning they never learned to end.
+  Learning to finish is a large part of what SFT must teach.
+- **Extra tokens help 2B, not 0.8B.** 2B-Base think on AIME 2025: 12.3% → 16.2% → 19.6% at
+  8k/16k/32k (pass@16 30% → 53%); MATH-500 saturates at 16k. 0.8B-Base stays flat (AIME 1.0% →
+  1.7%) while truncation falls: its long outputs wander. Implication: 8k is fine for 0.8B (its
+  problem is reasoning quality); for 2B, consider a 16k completion budget in later RL (step 9).
 - **The post-trained 2B is very verbose.** ~12.5k tokens on MATH-500 even when it finishes
-  (97% correct when it does). A model we train could beat it at a fixed token budget.
+  (97% correct when it does). At 8k it scores 0% on all AIME years and trails its own Base model
+  on every benchmark; at 32k it is roughly level with 2B-Base at 8k. Beating it at our 8k budget
+  is a concrete target for SFT + RL.
 
 ## Repo layout
 
@@ -228,6 +205,7 @@ configs/                       # one YAML per stage x model size, TrlParser form
 scripts/
   check_env.py                 # environment + kernel check (done)
   run_baselines.sh             # stage-0 evals, resumable (done)
+  run_followups.sh             # 8k ceiling + output-budget sweep (done)
   grpo.py                      # RL-Zero and main-track RL (todo, step 4)
   filter_by_passrate.py        # keep prompts with 0 < pass rate < 1 (todo, step 4)
   build_sft_data.py, sft.py    # (todo, step 5)
@@ -245,10 +223,8 @@ tests/                         # test_rewards.py, test_eval.py (25 passing)
 - Background jobs started from a Claude session die when the session ends; long runs are
   launched with `setsid nohup` instead.
 
-## Housekeeping once run 5 is done
-- Commit the uncommitted `eval.py` changes (GPQA prompt fix, `--regrade`, `--presence-penalty`,
-  protocol in summaries, summary merging, force-exit), `run_baselines.sh` (resumable, reduced-k
-  ceiling) and this file.
-- Add the final baseline table to the README.
-- Old-protocol outputs, protocol-ablation scratch runs and `scripts/rerun_gpqa.sh` were deleted
-  2026-09-30; their numbers are kept in the protocol section above.
+## Housekeeping log
+- 2026-09-30: old-protocol outputs, protocol-ablation scratch runs and `scripts/rerun_gpqa.sh`
+  deleted; their numbers are kept in the protocol section above.
+- 2026-10-01: stage-0 complete; eval changes and scripts committed (`a568fa3`); results added to
+  README.md.
