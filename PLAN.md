@@ -38,7 +38,7 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 | 1 | Environment: `pyproject.toml`, `scripts/check_env.py` | done |
 | 2 | Rewards: `src/posttrain/rewards.py` + tests | done |
 | 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | done |
-| 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | next |
+| 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | running: started 2026-10-01 19:35, 200 steps x ~230 s ≈ 13 h, `outputs/rlzero-0.8b/` |
 | 5 | SFT data build (Nemotron) + SFT on 0.8B | todo |
 | 6 | On-policy distillation on 0.8B | todo |
 | 7 | RL (main track) on 0.8B | todo |
@@ -79,11 +79,22 @@ an eval with the same protocol as the baselines afterwards.
 ### Stage 4: RL with verifiable rewards (`scripts/grpo.py`)
 - Data: DAPO-Math-17k + DeepMath-103K, **pre-filtered by the current policy's pass rate**
   (`scripts/filter_by_passrate.py`, k=8, keep 0 < p < 1), so every group has a learning signal.
+  Pool (`uv run -m posttrain.data build` → `data/rl/pool.parquet`, 101,957 prompts: 17,853 DAPO,
+  84,104 DeepMath). DAPO's "Answer: $Answer" wrapper is stripped; DAPO's 1.79M Hub rows are ~100x
+  duplicates. Dropped: 2 empty answers; **18,876 yes/no/true/false answers** (skewed ~4:1 to
+  "yes", so always guessing "Yes" would be rewarded); 104 eval overlaps (≥30% of an eval problem's
+  13-grams; a single shared 13-gram flagged 902, mostly AIME boilerplate). Known grader limit:
+  some equivalent notations are missed (e.g. `x < -5` vs `(-\infty,-5)`), giving occasional false
+  negatives on DeepMath's non-integer answers; DAPO's answers are all integers.
 - Rewards (`rewards.py`): `correctness_reward` (math-verify, 1/0), `format_reward` (small
   weight), `get_soft_overlong_punishment` (DAPO length penalty).
 - Recipe (SOTA defaults in TRL 1.14):
   - `loss_type="dapo"`, `epsilon=0.2`, `epsilon_high=0.28` (clip-higher), `beta=0.0`
-  - `num_generations=16`, rollout `temperature=1.0`, `max_completion_length` 4k then 8k
+  - `num_generations=16`, rollout `temperature=1.0`, `max_completion_length` 4k then 8k.
+    Staged lengthening follows DeepScaleR (1.5B: 8k → 16k → 24k), not DAPO: DAPO (Qwen2.5-32B)
+    used a fixed 20,480 tokens (16,384 expected + 4,096 soft-punish cache), 16 responses per
+    prompt, 512 prompts per batch, lr 1e-6. A short start suits 0.8B, which gained little from
+    longer budgets in the sweep; 2B may justify 16k (step 9).
   - `scale_rewards="batch"`, `mask_truncated_completions=True`
   - default vLLM importance-sampling correction (`sequence_mask`)
   - vLLM colocate, `vllm_gpu_memory_utilization≈0.35`, sleep mode; full fine-tune
@@ -91,6 +102,23 @@ an eval with the same protocol as the baselines afterwards.
   gets the same reward, completion length, truncation.
 - Loss ablation grid (0.8B, fixed step budget): `dapo` vs `dr_grpo` vs `cispo`
   (`epsilon_high=5.0`) vs GSPO (`importance_sampling_level="sequence"`) vs `sapo`.
+
+### GRPO on Qwen3.5 in TRL 1.14: what the smoke test needed (`scripts/grpo.py`)
+1. **Text-only vLLM.** TRL builds its colocated `vllm.LLM` without `limit_mm_per_prompt`, so vLLM
+   profiled the vision encoder and had no memory left for the KV cache. Patched in `grpo.py`.
+2. **vLLM V1 model runner** (`VLLM_USE_V2_MODEL_RUNNER=0`, set in `grpo.py`). The default V2
+   runner crashes in its startup profiling pass on Qwen3.5's DeltaNet layers in TRL's in-process mode.
+3. **Plain tokenizer.** Otherwise TRL loads `Qwen3VLProcessor` and takes its vision-model paths.
+4. **Logits memory.** `use_liger_kernel: true` selects TRL's chunked log-prob path (full logits:
+   30 GiB OOM). That path ignores `batch_size` and scored all 512 rollouts in one forward pass
+   (OOM again); `RowBatchedGRPOTrainer` in `grpo.py` splits those calls into 8-row slices.
+5. **8-bit AdamW** (`optim: adamw_bnb_8bit`). fp32 Adam states (~6 GB) left no room for vLLM to
+   wake for step 2. With it, vLLM at `gpu_memory_utilization: 0.30`.
+6. **Keep the GPU to ourselves.** An Ollama service on this machine loaded a 15.6 GB model mid-way
+   through testing. Long runs checkpoint every 25 steps so a crash can be resumed.
+
+Smoke test (3 steps): ~230 s/step; correctness reward ~17%, format ~64%, ~37% of rollouts hit the
+4,096-token limit, 0% all-equal-reward groups (the pass-rate filter works), entropy ~1.0.
 
 ### RL-Zero track (step 4, also an ablation)
 - Same stage-4 recipe on the Base model with the plain-text `zero` prompt, and

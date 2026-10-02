@@ -1,0 +1,63 @@
+# RL-Zero on Qwen3.5-0.8B-Base: GRPO directly on the Base model with the plain-text "zero" prompt.
+# Recipe: PLAN.md, Stage 4. Run: uv run scripts/grpo.py --config configs/grpo_rlzero_0.8b.yaml
+
+# --- script options ---
+model_name_or_path: Qwen/Qwen3.5-0.8B-Base
+mode: zero
+train_data: data/rl/rlzero-0.8b.parquet   # pass rate strictly between 0 and 1 for 0.8B-Base
+soft_punish_cache: 1024                   # overlong penalty ramps from 3,072 to 4,096 tokens
+format_reward_weight: 0.1
+
+# --- model loading ---
+model_init_kwargs:
+  dtype: bfloat16
+  use_kernels: true            # prebuilt Hub kernels for the DeltaNet conv (see check_env.py)
+bf16: true
+gradient_checkpointing: true
+# Chunked log-prob/entropy path. Without it TRL materializes full logits: 8 seqs x ~4.6k tokens x
+# 248k vocab tried to allocate 30 GiB and OOMed in the first smoke test.
+use_liger_kernel: true
+
+# --- GRPO loss (DAPO-style defaults) ---
+loss_type: dapo                # token-level normalization
+epsilon: 0.2
+epsilon_high: 0.28             # clip-higher: lets low-probability tokens grow, fights entropy collapse
+beta: 0.0                      # no KL penalty, no reference model
+scale_rewards: batch           # normalize advantages by batch std, not per-group std
+mask_truncated_completions: true
+
+# --- rollouts ---
+num_generations: 16            # group size per prompt
+max_completion_length: 4096
+temperature: 1.0
+top_p: 1.0
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.30   # ~9.4 GB: weights + KV cache (only 6 of 24 layers need KV)
+vllm_enable_sleep_mode: true   # free vLLM memory during the training step
+vllm_max_model_length: 5120    # prompt (<1k) + completion
+
+# --- batch: 8 completions/micro-batch x 64 accumulation = 512 = 32 prompts x 16 per optimizer step ---
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 64
+num_iterations: 1              # one optimizer step per rollout batch: fully on-policy
+
+# --- optimizer ---
+# 8-bit AdamW: fp32 Adam states (~6 GB for 0.8B) left no room for vLLM to wake for step 2 (OOM at
+# 30.6/31.3 GB in the smoke test); 8-bit states take ~1.5 GB.
+optim: adamw_bnb_8bit
+learning_rate: 1.0e-6          # DAPO's value
+lr_scheduler_type: constant_with_warmup
+warmup_steps: 10
+max_grad_norm: 1.0
+max_steps: 200
+
+# --- logging / saving ---
+output_dir: outputs/rlzero-0.8b
+logging_steps: 1
+log_completions: true
+num_completions_to_print: 2
+save_steps: 50
+save_total_limit: 4
+report_to: none
+seed: 0
