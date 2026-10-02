@@ -38,11 +38,11 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 | 1 | Environment: `pyproject.toml`, `scripts/check_env.py` | done |
 | 2 | Rewards: `src/posttrain/rewards.py` + tests | done |
 | 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | done |
-| 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | running: started 2026-10-01 19:35, 200 steps x ~230 s ≈ 13 h, `outputs/rlzero-0.8b/` |
-| 5 | SFT data build (Nemotron) + SFT on 0.8B | todo |
+| 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | done 2026-10-02 08:15 (`outputs/rlzero-0.8b/`); results below |
+| 5 | SFT data build (Nemotron) + SFT on 0.8B | code drafted 2026-10-02 (`build_sft_data.py`, `sft.py`, `configs/sft_0.8b.yaml`; checked on CPU only); data build, GPU smoke test and run todo |
 | 6 | On-policy distillation on 0.8B | todo |
 | 7 | RL (main track) on 0.8B | todo |
-| 8 | Ablations on 0.8B: +DPO, SFT-only vs SFT+distill, RL loss grid | todo |
+| 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (queued, `scripts/run_update_ablation.sh`), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation: arm B running (done ~14:45), arm C dropped; rest todo |
 | 9 | Promote winning configs to 2B (then 4B LoRA if time) | todo |
 
 Every step: small increments, a smoke test (20 steps, peak VRAM logged) before any long run, and
@@ -62,6 +62,26 @@ an eval with the same protocol as the baselines afterwards.
 - Success: think-mode truncation on AIME drops well below the Base model's 84-90%, MATH-500 up.
 - Risk: frontier-teacher traces may be hard for a 0.8-2B student to imitate (capacity gap).
   Fallback: compare against a small set of self-generated Qwen3.5-9B traces.
+
+Draft notes (2026-10-02; nothing run on the GPU yet, the update ablation had it):
+- **Data layout.** One 154 GB JSONL. Reasoning is in the assistant message's `reasoning_content`,
+  the write-up in `content`; Qwen3.5's chat template renders that pair as
+  `<think>\n...\n</think>\n\n...`. CoT rows fill about the first 65% of the file in alternating
+  AoPS / StackExchange blocks, TIR rows the rest, so `build_sft_data.py` reads the start of
+  randomly ordered slices (HTTP range requests) instead of the first N rows.
+- **Traces are long.** No-TIR completions: median ~12.7k tokens, 37% within 8k, 60% within 16k
+  (156-row sample). The build keeps traces up to 16k; `configs/sft_0.8b.yaml` trains on those
+  within 8,192 (`max_completion_tokens`), the budget 0.8B is evaluated and RL-trained at.
+- **Grader-verified traces only** (default; `--keep-unverified` disables): the trace's boxed
+  answer must match `expected_answer` under `is_correct`. This drops ~57% of the length-OK rows
+  (about 65% of StackExchange, 33% of AoPS), mostly free-form answers the grader cannot compare
+  (text, several-part answers), plus some real mismatches. Overall yield ~23% of CoT rows, so
+  100k traces need ~18 GB read.
+- **Prompt/completion format.** The prompt is `render_prompt(problem, "think")`, as in eval and
+  RL; loss on the completion only; TRL appends `<|im_end|>` (`eos_token`).
+- **No packing.** TRL separates packed traces by `position_ids`, which only its Flash Attention
+  path honors; the DeltaNet layers would carry state across traces. Batch size 1 (no padding)
+  with gradient accumulation 16 instead. Loss is `chunked_nll`, not Liger.
 
 ### Stage 2: On-policy distillation (`scripts/distill.py`)
 - `trl.DistillationTrainer`, `beta≈1.0` (reverse KL; mode-seeking, standard for on-policy KD).
@@ -119,6 +139,52 @@ an eval with the same protocol as the baselines afterwards.
 
 Smoke test (3 steps): ~230 s/step; correctness reward ~17%, format ~64%, ~37% of rollouts hit the
 4,096-token limit, 0% all-equal-reward groups (the pass-rate filter works), entropy ~1.0.
+
+### Updates-per-rollout ablation (step 8, queued: `scripts/run_update_ablation.sh`)
+With one optimizer step per rollout (our default, and the GRPO paper's: "the policy model only has
+a single update following each exploration stage"), the probability ratio is exactly 1, so PPO-style
+clipping, and with it DAPO's clip-higher, never triggers (clip ratio 0 in every logged step). DAPO
+took 16 updates per rollout (512 prompts x 16 responses, mini-batch 512). Arms, all at the same
+rollout budget of 100 rollouts x 512 samples:
+
+| arm | updates/rollout | clip (low/high) | output |
+|---|---|---|---|
+| A | 1 | inactive | main run, step-100 checkpoint copied to `outputs/rlzero-0.8b-step100` |
+| B | 4 | 0.2 / 0.28 | `outputs/rlzero-0.8b-4upd-cliphigher` |
+| ~~C~~ | 4 | 0.2 / 0.2 | dropped (see below) |
+
+4 updates/rollout = `gradient_accumulation_steps: 16`, `steps_per_generation: 64` (TRL then keeps
+generation-time log-probs, so ratios move off 1 on updates 2-4); `max_steps: 400`, warmup 40 and
+saves every 100 to stay matched per rollout. Same learning rate, so B/C also take 4x as many
+optimizer steps per rollout (inherent to the comparison, as in DAPO). Questions: learning per
+rollout, stability (entropy, reward), and whether clip-higher keeps entropy up. Each arm is
+evaluated with the standard zero-mode eval; arm A also at step 200. ~13 h for B + C after the
+main run; queue log `outputs/ablation.log`.
+
+**Arm C dropped (2026-10-02).** Even with 4 updates per rollout, arm B clips only ~0.008% of
+tokens (max 0.09% in any step): at lr 1e-6 four updates move the 0.8B policy too little for ratios
+to reach 0.8 / 1.28, so clip-higher vs symmetric clipping cannot differ here. A more informative
+follow-up, if wanted: 1 update/rollout at lr 4e-6, to separate "reusing samples" from "moving the
+weights 4x further per rollout". Early signal: arm B's training reward at rollouts 21-24 was 21.5%
+vs ~18.5% for arm A at the same point.
+
+### RL-Zero result: Qwen3.5-0.8B-Base, 200 steps (2026-10-02)
+Eval (zero mode, 8k, standard protocol, avg@k %):
+
+| | MATH-500 | AIME 24/25/26 | AMC23 | GPQA | MATH format | MATH truncated | MATH tokens |
+|---|---|---|---|---|---|---|---|
+| 0.8B-Base | 35.5 | 1.2 / 0.8 / 0.2 | 16.9 | 17.8 | 79% | 17% | 2,124 |
+| step 100 | 34.8 | 0.8 / 0.2 / 0.4 | 16.9 | 22.3 | 92% | 7% | 1,163 |
+| step 200 | 37.9 | 1.5 / 0.4 / 0.2 | 17.5 | 22.2 | 96% | 4% | 887 |
+
+Training (25-step blocks): reward 17.7% → 31.1%, truncation 34% → 9%, length 1,386 → 1,027,
+entropy 1.02 → 0.58. Reading: RL-Zero mainly taught finishing cleanly and concisely; the large
+training-reward gain (at T=1.0, where the Base model rambles and loops) transfers only modestly to
+the eval protocol (T=0.6 + presence penalty already suppresses much of that), and the 1,913
+prompts were seen ~3.3 times. MATH-500 +2.4 and GPQA +4.4 are ~1.5x their noise; AIME/AMC flat.
+pass@k did not rise (AIME pass@16 fell), consistent with RLVR sharpening existing ability more
+than adding new solutions; entropy is declining steadily and needs watching in longer runs.
+Clipping never triggered (1 update/rollout: ratio exactly 1).
 
 ### RL-Zero track (step 4, also an ablation)
 - Same stage-4 recipe on the Base model with the plain-text `zero` prompt, and
@@ -228,7 +294,7 @@ src/posttrain/
   prompts.py                   # think / zero prompt templates + stop strings (done)
   rewards.py                   # correctness, format, overlong penalty (done)
   eval.py                      # vLLM eval, --regrade (done)
-  data.py                      # dataset loaders, filters, decontamination (todo, step 4-5)
+  data.py                      # RL pool, decontamination, GRPO / SFT dataset formats (done)
 configs/                       # one YAML per stage x model size, TrlParser format (todo)
 scripts/
   check_env.py                 # environment + kernel check (done)
@@ -236,7 +302,7 @@ scripts/
   run_followups.sh             # 8k ceiling + output-budget sweep (done)
   grpo.py                      # RL-Zero and main-track RL (todo, step 4)
   filter_by_passrate.py        # keep prompts with 0 < pass rate < 1 (todo, step 4)
-  build_sft_data.py, sft.py    # (todo, step 5)
+  build_sft_data.py, sft.py    # (drafted, step 5)
   distill.py                   # (todo, step 6)
   make_dpo_pairs.py, dpo.py    # (todo, step 8)
   smoke_test.sh                # 20 steps of each stage on 0.8B (todo)

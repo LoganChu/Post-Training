@@ -1,0 +1,53 @@
+# SFT cold-start on Qwen3.5-0.8B-Base from Nemotron-SFT-Math-v3 traces (think format).
+# Recipe: PLAN.md, Stage 1. Run: uv run scripts/sft.py --config configs/sft_0.8b.yaml
+
+# --- script options ---
+model_name_or_path: Qwen/Qwen3.5-0.8B-Base
+train_data: data/sft/nemotron-train.parquet   # scripts/build_sft_data.py (traces up to 16k tokens)
+eval_data: data/sft/nemotron-val.parquet
+# Train only on traces that finish within the 8k budget this model is evaluated and RL-trained at.
+# The traces' median is ~12k tokens; imitating those would teach 0.8B to run past its budget, the
+# failure the post-trained 2B shows at 8k.
+max_completion_tokens: 8192
+
+# --- model loading ---
+model_init_kwargs:
+  dtype: bfloat16
+  use_kernels: true            # prebuilt Hub kernels for the DeltaNet conv (see check_env.py)
+bf16: true
+gradient_checkpointing: true
+
+# --- loss / sequence handling ---
+eos_token: "<|im_end|>"        # Base EOS is <|endoftext|>; chat turns must end in <|im_end|>
+loss_type: chunked_nll         # lm_head only on completion tokens, in chunks: no full 248k-vocab logits
+max_length: 9216               # prompt (<= 1,024) + completion (<= 8,192): nothing is truncated
+# No packing. TRL's packing joins traces into one sequence and separates them by position_ids,
+# which only its Flash Attention path honors. Qwen3.5's DeltaNet layers carry recurrent state
+# straight across the joins, so each trace would see the ones packed before it.
+packing: false
+
+# --- batch: one trace per forward pass (no padding), 16 traces per optimizer step ---
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 16
+num_train_epochs: 1
+
+# --- optimizer ---
+optim: adamw_bnb_8bit          # 8-bit Adam states, as in GRPO
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_steps: 100
+weight_decay: 0.0
+max_grad_norm: 1.0
+
+# --- eval loss on held-out problems ---
+eval_strategy: steps
+eval_steps: 500
+per_device_eval_batch_size: 1
+
+# --- logging / saving ---
+output_dir: outputs/sft-0.8b
+logging_steps: 10
+save_steps: 500
+save_total_limit: 3
+report_to: none
+seed: 0

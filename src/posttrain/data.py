@@ -1,9 +1,11 @@
-"""RL prompt datasets: loading, cleaning, decontamination, and conversion to TRL's GRPO format.
+"""Training datasets: loading, cleaning, decontamination, and conversion to TRL's formats.
 
-Rows are stored mode-neutral as {"problem", "solution", "source", "id"}; `to_grpo_dataset` renders
-the prompt for a given mode ("zero" or "think") at training time, so both tracks share one file.
+RL prompts are stored mode-neutral as {"problem", "solution", "source", "id"}; `to_grpo_dataset`
+renders the prompt for a given mode ("zero" or "think") at training time, so both tracks share one
+file. SFT traces (built by scripts/build_sft_data.py) add the teacher's {"reasoning", "answer"};
+`to_sft_dataset` renders them as prompt/completion pairs with the same think-mode prompt as eval.
 
-Usage (build the cleaned pool once):
+Usage (build the cleaned RL pool once):
   uv run -m posttrain.data build --out data/rl/pool.parquet
 """
 
@@ -16,8 +18,8 @@ from pathlib import Path
 from datasets import Dataset, concatenate_datasets, load_dataset
 
 from posttrain.eval import BENCHMARKS, load_problems
-from posttrain.prompts import ZERO_TEMPLATE, Mode, conversational_prompt
-from posttrain.rewards import is_correct
+from posttrain.prompts import ZERO_TEMPLATE, Mode, conversational_prompt, render_prompt
+from posttrain.rewards import THINK_CLOSE, THINK_OPEN, is_correct
 
 # DAPO-Math-17k wraps every problem in a fixed instruction asking for "Answer: $Answer"; strip it so
 # our own \boxed{} prompt is the only answer-format instruction the model sees.
@@ -143,6 +145,70 @@ def to_grpo_dataset(ds: Dataset, mode: Mode) -> Dataset:
         return {"prompt": prompt}
 
     return ds.map(fmt, remove_columns=[c for c in ds.column_names if c not in ("solution", "source", "id")])
+
+
+# --- SFT traces (nvidia/Nemotron-SFT-Math-v3) ---
+NEMOTRON_NO_TIR = "without Python TIR"  # `tool_usage` of plain chain-of-thought rows (no Python tool calls)
+
+
+def problem_key(problem: str) -> str:
+    """Whitespace- and case-insensitive key for counting traces per problem."""
+    return " ".join(problem.lower().split())
+
+
+def nemotron_to_trace(row: dict) -> dict | str:
+    """One Nemotron row as a mode-neutral trace, or the reason (a short string) it is unusable.
+
+    Nemotron keeps the teacher's reasoning in the assistant message's `reasoning_content` and the
+    final write-up in `content`. Its user turn carries its own instruction ("Solve the following
+    math problem. Make sure to put the answer (and only answer) inside \\boxed{}."), so we take the
+    bare `problem` field and add our own prompt at training time.
+    """
+    if row["tool_usage"] != NEMOTRON_NO_TIR:
+        return "tir"
+    messages = row["messages"]
+    if [m["role"] for m in messages] != ["user", "assistant"]:
+        return "not_single_turn"
+    reasoning = (messages[1].get("reasoning_content") or "").strip()
+    answer = (messages[1].get("content") or "").strip()
+    if not reasoning or not answer:
+        return "empty"
+    # The rewards give credit only for exactly one </think> (ours) and no <think> in the completion.
+    if any(tag in text for tag in (THINK_OPEN, THINK_CLOSE) for text in (reasoning, answer)):
+        return "think_tags"
+    if "\\boxed{" not in answer:
+        return "no_boxed"
+    return {
+        "id": f"nemotron-{row['uuid']}",
+        "problem": row["problem"].strip(),
+        "reasoning": reasoning,
+        "answer": answer,
+        "solution": row["expected_answer"].strip(),
+        "source": row["data_source"],
+    }
+
+
+def sft_completion(reasoning: str, answer: str) -> str:
+    """The text the model should generate after the think-mode prompt (which ends in "<think>\\n").
+
+    Identical to what Qwen3.5's chat template renders for an assistant turn with `reasoning_content`,
+    up to but excluding the closing <|im_end|>: SFTTrainer appends the EOS token itself.
+    """
+    return f"{reasoning.strip()}\n{THINK_CLOSE}\n\n{answer.strip()}"
+
+
+def to_sft_dataset(ds: Dataset, tokenizer) -> Dataset:
+    """TRL SFT prompt-completion format: loss on the completion only, and the prompt is rendered by
+    the same `render_prompt` eval and RL use, so the model trains on exactly the prompt it is later
+    run with."""
+
+    def fmt(r):
+        return {
+            "prompt": render_prompt(r["problem"], "think", tokenizer),
+            "completion": sft_completion(r["reasoning"], r["answer"]),
+        }
+
+    return ds.map(fmt, remove_columns=ds.column_names)
 
 
 def main() -> None:
