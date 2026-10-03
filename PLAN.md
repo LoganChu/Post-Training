@@ -39,10 +39,10 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 | 2 | Rewards: `src/posttrain/rewards.py` + tests | done |
 | 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | done |
 | 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | done 2026-10-02 08:15 (`outputs/rlzero-0.8b/`); results below |
-| 5 | SFT data build (Nemotron) + SFT on 0.8B | code drafted 2026-10-02 (`build_sft_data.py`, `sft.py`, `configs/sft_0.8b.yaml`; checked on CPU only); data build, GPU smoke test and run todo |
+| 5 | SFT data build (Nemotron) + SFT on 0.8B | smoke test passed 2026-10-02; full pipeline running (`scripts/run_sft.sh`: 50k build → SFT → think eval; log `outputs/sft.log`) |
 | 6 | On-policy distillation on 0.8B | todo |
 | 7 | RL (main track) on 0.8B | todo |
-| 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (queued, `scripts/run_update_ablation.sh`), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation: arm B running (done ~14:45), arm C dropped; rest todo |
+| 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (queued, `scripts/run_update_ablation.sh`), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation done 2026-10-02 (arm C dropped); rest todo |
 | 9 | Promote winning configs to 2B (then 4B LoRA if time) | todo |
 
 Every step: small increments, a smoke test (20 steps, peak VRAM logged) before any long run, and
@@ -82,6 +82,40 @@ Draft notes (2026-10-02; nothing run on the GPU yet, the update ablation had it)
 - **No packing.** TRL separates packed traces by `position_ids`, which only its Flash Attention
   path honors; the DeltaNet layers would carry state across traces. Batch size 1 (no padding)
   with gradient accumulation 16 instead. Loss is `chunked_nll`, not Liger.
+
+- **Review + smoke test (2026-10-02).** Verified on real tokenized examples: no loss on the prompt,
+  loss on reasoning + `</think>` + answer + final `<|im_end|>`; prompt/completion token boundary
+  clean (0/50 mismatches); `chunked_nll` is TRL 1.14's default. 20-step smoke: 6.9 s/step (16
+  traces, mean 4.2k tokens), peak 7.8 GiB allocated, loss ~0.55 / token accuracy ~82% from the
+  start (0.8B-Base already predicts the teacher well; the job is mostly format and finishing).
+- **Small build stats** (400 traces): 54% of kept traces fit the 8k budget (median 7.5k tokens);
+  34% of rows dropped as "unverified". Sampled: mostly open-ended answers our grader cannot check
+  (multi-line derivations, constructions, statements), plus some equivalent notations; keeping the
+  filter aligns SFT with what RL rewards and eval measures. Grader limit found: `math_verify`
+  reads `\log` as base 10, so `\log 2` != `\ln 2`.
+- **Full run:** 50k-trace build (~27k within 8k) chosen over 100k: ~2-2.5 h build + ~3.3 h SFT.
+- **Crash 2026-10-02 16:09 (first full attempt).** One build worker grew to 20 GB of RAM while
+  checking traces; the 30 GB machine ran out of memory, VS Code's terminal host was killed, and the
+  pipeline (inside VS Code's cgroup despite `setsid`) died with it. Culprit row not identified;
+  likely pathological sympy arithmetic in the grader (sympy uses Python ints here, which the
+  grader's signal timeouts cannot interrupt mid-operation). Fix: each worker caps its heap at its
+  starting VmData + 2.5 GB (`RLIMIT_DATA`; a fixed cap fails because forked workers already hold
+  ~2.7 GB of virtual data), and a `MemoryError` drops the row as `grader_memory` with its uuid
+  logged. Long jobs now run in their own systemd scope (`systemd-run --user --scope`), so a VS
+  Code cleanup cannot take them down.
+- **Stall 2026-10-02 16:27-21:06 (second attempt).** The build froze at slice 120 (~10 min in)
+  for 4.5 h: 6 workers at 100% CPU in endless sympy computations, one blocked on a lock. Root
+  cause: math_verify's SIGALRM timeouts are lost when the alarm fires inside an object's `__del__`
+  (Python swallows it: "Exception ignored in ... __del__"); this probably also explains the 20 GB
+  worker. Results are consumed in order, so one stuck slice blocked everything while finished
+  results piled up. Fixes in `build_sft_data.py`: a watchdog thread per worker re-raises a
+  `RowTimeout` via SIGUSR1 every second once a row exceeds 30 s (SIGINT/`interrupt_main()` does not
+  work: background jobs start with SIGINT ignored, and Python drops simulated SIGINTs); garbage
+  collection is paused while a row is graded; at most 2 slices per worker are in flight. Tested:
+  a never-ending computation and one that keeps swallowing interrupts are both cut at 30 s, and
+  the 400-trace build is unchanged. `run_sft.sh` now line-buffers the build log so stalls show.
+  The GRPO reward path uses the same math_verify timeouts; the same failure there would hang a
+  training step rather than crash it.
 
 ### Stage 2: On-policy distillation (`scripts/distill.py`)
 - `trl.DistillationTrainer`, `beta≈1.0` (reverse KL; mode-seeking, standard for on-policy KD).
@@ -167,6 +201,21 @@ to reach 0.8 / 1.28, so clip-higher vs symmetric clipping cannot differ here. A 
 follow-up, if wanted: 1 update/rollout at lr 4e-6, to separate "reusing samples" from "moving the
 weights 4x further per rollout". Early signal: arm B's training reward at rollouts 21-24 was 21.5%
 vs ~18.5% for arm A at the same point.
+
+**Result (2026-10-02).** Zero-mode eval, avg@k %:
+
+| | rollouts | MATH-500 | AIME 24/25/26 | AMC23 | GPQA | MATH format | MATH truncated | MATH tokens |
+|---|---|---|---|---|---|---|---|---|
+| A, 1 update/rollout | 100 | 34.8 | 0.8 / 0.2 / 0.4 | 16.9 | 22.3 | 92% | 7% | 1,163 |
+| B, 4 updates/rollout | 100 | 37.5 | 1.9 / 0.0 / 0.6 | 15.0 | 25.9 | 96% | 4% | 941 |
+| A, 1 update/rollout | 200 | 37.9 | 1.5 / 0.4 / 0.2 | 17.5 | 22.2 | 96% | 4% | 887 |
+
+B after 100 rollouts matches A after 200 (MATH-500, format, truncation, length; GPQA/AMC
+differences are within noise), in ~6.5 h instead of ~12.7 h. Training curves show the same
+trajectory traversed ~2x faster per rollout, entropy included, so B is faster, not better at the
+end; without the 4x-lr control, "more weight movement per rollout" and "sample reuse" are not
+separated. Clipping stayed negligible (~0.009% of tokens). **Decision: use 4 updates per rollout
+(`gradient_accumulation_steps: 16`, `steps_per_generation: 64`) for later RL runs.**
 
 ### RL-Zero result: Qwen3.5-0.8B-Base, 200 steps (2026-10-02)
 Eval (zero mode, 8k, standard protocol, avg@k %):
@@ -315,7 +364,11 @@ tests/                         # test_rewards.py, test_eval.py (25 passing)
 - Memory for distillation (4B teacher + 2B student + vLLM).
 - Nemotron trace length vs student capacity (see stage 1).
 - Background jobs started from a Claude session die when the session ends; long runs are
-  launched with `setsid nohup` instead.
+  launched with `setsid nohup` inside their own `systemd-run --user --scope`, since a VS Code
+  memory-pressure cleanup killed a `setsid` job on 2026-10-02.
+- **The grader can blow up memory** (see the SFT crash). The build is now capped, but GRPO computes
+  rewards in the trainer process: a model output that triggers the same pathology could OOM a run.
+  Not seen in ~300 GRPO steps so far; if it happens, run reward grading in a capped subprocess.
 
 ## Housekeeping log
 - 2026-09-30: old-protocol outputs, protocol-ablation scratch runs and `scripts/rerun_gpqa.sh`

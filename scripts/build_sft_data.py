@@ -26,12 +26,19 @@ Usage:
   uv run scripts/build_sft_data.py --target 200 --val 20 --out-dir /tmp/sft-check   # quick check
 """
 
+import _thread
 import argparse
+import gc
 import json
 import multiprocessing
 import os
 import random
+import resource
+import signal
+import sys
+import threading
 import time
+from collections import deque
 from collections import Counter
 from pathlib import Path
 
@@ -39,6 +46,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # workers are forked p
 
 import pandas as pd
 from huggingface_hub import HfFileSystem
+from math_verify.errors import TimeoutException
 from transformers import AutoTokenizer
 
 from posttrain.data import OVERLAP_THRESHOLD, eval_index, nemotron_to_trace, problem_key, sft_completion
@@ -53,18 +61,85 @@ TIR_PROBE_ROWS = 8
 # average ~3.3); lets us skip tokenizing the many 50k+ token traces.
 MAX_CHARS_PER_TOKEN = 8
 
+# Per-worker memory headroom. On 2026-10-02 one worker grew to 20 GB of RAM while checking traces
+# (the 30 GB machine ran out of memory, taking VS Code's terminals and this pipeline down). sympy
+# uses Python ints here, so under a cap a runaway allocation raises MemoryError, which the caller of
+# check_trace turns into a dropped row. RLIMIT_DATA counts virtual data, and a forked worker already
+# has ~2.7 GB of it (inherited imports) while using ~0.7 GB of RAM, so the cap is set relative to
+# the worker's own starting size. 8 workers x (0.7 + 2.5) GB fits in RAM.
+WORKER_HEADROOM_BYTES = int(2.5 * 2**30)
+
+
+# Per-row time limit, enforced by a watchdog thread. math_verify's own timeouts are SIGALRM-based:
+# when the alarm fires while Python is running some object's __del__ (e.g. during a garbage
+# collection inside sympy), the exception is swallowed ("Exception ignored in ... __del__") and
+# the timeout is lost. On 2026-10-02 that left 6 of 8 workers in endless sympy computations and
+# stalled the build for 4.5 h. The watchdog re-raises RowTimeout (via SIGUSR1) every second until
+# the row ends, and garbage collection is paused while a row is graded. SIGUSR1 rather than
+# _thread.interrupt_main's default SIGINT: background jobs start with SIGINT ignored, and Python
+# then silently drops simulated SIGINTs.
+ROW_TIMEOUT_S = 30
+# Slices in flight per worker. Results are consumed in order, so one slow slice must not let the
+# other workers pile up unbounded results in the parent.
+SLICES_IN_FLIGHT_PER_WORKER = 2
+
+
+def _vm_data_bytes() -> int:
+    with open("/proc/self/status") as f:
+        return next(int(line.split()[1]) * 1024 for line in f if line.startswith("VmData:"))
+
 # Per-worker state. `_index` is built in the parent and inherited through fork; the tokenizer and
 # file system are created in each worker.
 _args: argparse.Namespace
 _index = None
 _tokenizer = None
 _fs = None
+_row_deadline: float | None = None
+
+
+class RowTimeout(Exception):
+    pass
+
+
+def _raise_row_timeout(signum, frame):
+    raise RowTimeout
+
+
+def _watchdog() -> None:
+    while True:
+        time.sleep(1)
+        deadline = _row_deadline
+        if deadline is not None and time.monotonic() > deadline:
+            _thread.interrupt_main(signal.SIGUSR1)
 
 
 def _init_worker() -> None:
     global _tokenizer, _fs
     _tokenizer = AutoTokenizer.from_pretrained(_args.tokenizer)
     _fs = HfFileSystem(skip_instance_cache=True)
+    cap = _vm_data_bytes() + WORKER_HEADROOM_BYTES
+    resource.setrlimit(resource.RLIMIT_DATA, (cap, cap))
+    signal.signal(signal.SIGUSR1, _raise_row_timeout)
+    threading.Thread(target=_watchdog, daemon=True).start()
+
+
+def check_row(row: dict) -> dict | str:
+    """check_trace with the per-row time limit and memory cap turned into drop reasons."""
+    global _row_deadline
+    gc.disable()
+    _row_deadline = time.monotonic() + ROW_TIMEOUT_S
+    try:
+        return check_trace(row)
+    except (RowTimeout, TimeoutException):
+        reason = "grader_timeout"
+    except MemoryError:
+        reason = "grader_memory"
+    finally:
+        _row_deadline = None
+        gc.enable()
+    answer = (row.get("expected_answer") or "")[:200]
+    print(f"[{reason}] {row.get('uuid')} expected_answer={answer!r}", file=sys.stderr, flush=True)
+    return reason
 
 
 def check_trace(row: dict) -> dict | str:
@@ -98,18 +173,23 @@ def read_slice(start: int) -> tuple[list[dict], Counter, int]:
             f.seek(start)
             f.readline()  # we landed mid-row; start at the next one
         seen = 0
-        while f.tell() - start < budget:
-            line = f.readline()
-            if not line:
-                break
-            result = check_trace(json.loads(line))
-            seen += 1
-            if isinstance(result, str):
-                drops[result] += 1
-                if seen == TIR_PROBE_ROWS and drops["tir"] == seen:
+        try:
+            while f.tell() - start < budget:
+                line = f.readline()
+                if not line:
                     break
-            else:
-                traces.append(result)
+                result = check_row(json.loads(line))
+                seen += 1
+                if isinstance(result, str):
+                    drops[result] += 1
+                    if seen == TIR_PROBE_ROWS and drops["tir"] == seen:
+                        break
+                else:
+                    traces.append(result)
+        except (RowTimeout, TimeoutException):
+            # A watchdog interrupt or stray alarm that landed just after a row finished: keep what
+            # this slice produced and move on (the file handle may be mid-request).
+            drops["slice_interrupted"] += 1
         return traces, drops, f.tell() - start
 
 
@@ -140,10 +220,24 @@ def main() -> None:
 
     want = args.target + args.val
     kept, per_problem, drops, read_bytes, t0 = [], Counter(), Counter(), 0, time.time()
-    # Ordered imap + a seeded slice order: the slices used are a prefix of that order, so a rebuild
-    # gives the same set whatever the workers' timing.
+    # Results are consumed in submission order and the slice order is seeded, so the slices used are
+    # a prefix of that order and a rebuild gives the same set whatever the workers' timing (except
+    # rows near the per-row time limit, which can fall either side of it).
     with multiprocessing.get_context("fork").Pool(args.workers, initializer=_init_worker) as pool:
-        for n, (traces, slice_drops, nbytes) in enumerate(pool.imap(read_slice, starts), 1):
+        todo, pending = iter(starts), deque()
+
+        def submit() -> None:
+            start = next(todo, None)
+            if start is not None:
+                pending.append(pool.apply_async(read_slice, (start,)))
+
+        for _ in range(SLICES_IN_FLIGHT_PER_WORKER * args.workers):
+            submit()
+        n = 0
+        while pending:
+            traces, slice_drops, nbytes = pending.popleft().get()
+            submit()
+            n += 1
             drops.update(slice_drops)
             read_bytes += nbytes
             for trace in traces:

@@ -45,11 +45,12 @@ class ScriptArguments:
 def load_traces(path: str, max_completion_tokens: int, tokenizer, max_samples: int | None = None, seed: int = 0) -> Dataset:
     df = pd.read_parquet(path)
     keep = df[df.completion_tokens <= max_completion_tokens]
+    n_within = len(keep)
     if max_samples is not None and max_samples < len(keep):
         keep = keep.sample(n=max_samples, random_state=seed)
     print(
-        f"[data] {path}: {len(keep)} of {len(df)} traces within {max_completion_tokens} completion tokens "
-        f"(mean {keep.completion_tokens.mean():.0f}, total {keep.completion_tokens.sum() / 1e6:.1f}M)"
+        f"[data] {path}: {n_within} of {len(df)} traces within {max_completion_tokens} completion tokens; "
+        f"using {len(keep)} (mean {keep.completion_tokens.mean():.0f}, total {keep.completion_tokens.sum() / 1e6:.1f}M tokens)"
     )
     return to_sft_dataset(Dataset.from_pandas(keep, preserve_index=False), tokenizer)
 
