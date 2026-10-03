@@ -39,8 +39,8 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 | 2 | Rewards: `src/posttrain/rewards.py` + tests | done |
 | 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | done |
 | 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | done 2026-10-02 08:15 (`outputs/rlzero-0.8b/`); results below |
-| 5 | SFT data build (Nemotron) + SFT on 0.8B | smoke test passed 2026-10-02; full pipeline running (`scripts/run_sft.sh`: 50k build → SFT → think eval; log `outputs/sft.log`) |
-| 6 | On-policy distillation on 0.8B | todo |
+| 5 | SFT data build (Nemotron) + SFT on 0.8B | first run (bf16 weights) learned almost nothing; v2 (fp32, from Base, <=8k traces) running since 2026-10-03 11:01 (`scripts/run_sft_v2.sh`, log `outputs/sft-v2.log`) |
+| 6 | On-policy distillation on 0.8B | first smoke test (bf16 SFT student) stopped at the gate: 80-91% of rollouts truncated; re-queued after SFT v2 on the better arm |
 | 7 | RL (main track) on 0.8B | todo |
 | 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (queued, `scripts/run_update_ablation.sh`), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation done 2026-10-02 (arm C dropped); rest todo |
 | 9 | Promote winning configs to 2B (then 4B LoRA if time) | todo |
@@ -117,6 +117,35 @@ Draft notes (2026-10-02; nothing run on the GPU yet, the update ablation had it)
   The GRPO reward path uses the same math_verify timeouts; the same failure there would hang a
   training step rather than crash it.
 
+### Precision bug: bf16 weights froze most parameters (found 2026-10-03)
+All training configs loaded models with `model_init_kwargs: {dtype: bfloat16}`, so weights were
+stored in bf16 and AdamW wrote updates straight into them. bf16 has 7 mantissa bits (~1/128
+relative): a weight of 0.02 can only move in steps of ~1.6e-4, while an Adam step is ~lr (1e-5 for
+SFT, 1e-6 for GRPO), so the update rounds away. In the first SFT checkpoint (layer-10 down_proj):
+|w| < 1e-3 → 99.5% of elements changed; 1e-3-3e-3 → 54%; 3e-3-1e-2 → 2%; >= 1e-2 → 0%. All norms,
+q/k norms, `A_log` and `dt_bias` (values ~1) were bit-identical. Training loss stayed ~0.596 for
+1,600 steps; eval matched the Base model. Fix: `dtype: float32` (fp32 master weights) with
+`bf16: true` (bf16 compute) in all three configs; the frozen distillation teacher stays bf16.
+Checks: with fp32 every element moves (~3.4e-5 each, all magnitudes); overfitting 32 traces,
+loss after 10 steps is 0.24 (fp32) vs 0.38 (bf16); SFT peak memory 12.7 GiB (was 7.8).
+**Affected earlier results:** RL-Zero and the updates-per-rollout ablation ran with the bf16
+setting (lr 1e-6), so they learned through only the smallest weights; their gains and conclusions
+may understate RL. Rerun in fp32 later (GRPO memory will be tighter: fp32 weights + grads add ~3 GB).
+Separately from the bug, the SFT data leaves little to learn: even in fp32 the real-data loss stays
+~0.60 early on (0.8B-Base already predicts the teacher at 81% token accuracy), and the teacher's
+"reason as long as needed" style runs past 8k on hard problems. Hence SFT v2's 4k-trace arm.
+
+### SFT v2: fp32, <=8k traces (`scripts/run_sft_v2.sh`, started 2026-10-03 11:01)
+Starts again from `Qwen/Qwen3.5-0.8B-Base` (not from RL-Zero: SFT is the main track's first
+stage), on the 25.7k traces within 8,192 completion tokens, the eval budget every stage shares.
+Then the think-mode eval, then `run_distill_chain.sh` on `outputs/sft-0.8b-8k`. A 4k-trace arm
+(12.2k traces) was started and stopped after a few minutes at the user's request; not run. The distillation gate now only checks that EOS works
+(`clipped_ratio` <= 0.95 every step): the bf16 SFT student truncated 80-91% of T=1.0 rollouts,
+which is genuine length, not an EOS bug. Memory risk: the earlier smoke test peaked at 26.1 GiB
+with a bf16 student; an fp32 student adds ~3 GB. First (bf16) SFT result for reference, think 8k:
+MATH-500 49.9, AIME 2.5/0.8/0.8, AMC 24.7, GPQA 11.5; truncation MATH 32%, AIME 84-87%
+(`outputs/sft-0.8b-bf16`, `outputs/eval/outputs-sft-0.8b-bf16-think`).
+
 ### Stage 2: On-policy distillation (`scripts/distill.py`)
 - `trl.DistillationTrainer`, `beta≈1.0` (reverse KL; mode-seeking, standard for on-policy KD).
 - Student: stage-1 checkpoint. Teacher: Qwen3.5-4B thinking (must share the student's
@@ -124,6 +153,44 @@ Draft notes (2026-10-02; nothing run on the GPU yet, the update ablation had it)
 - Prompt-only math prompts (DeepMath-103K), decontaminated.
 - vLLM colocate with `vllm_enable_sleep_mode`. If 4B teacher + 2B student + vLLM do not fit:
   LoRA student, quantized teacher, or `AsyncDistillationTrainer`.
+
+Draft notes (2026-10-02; nothing run on the GPU or with model weights: the SFT pipeline had the
+machine, with ~6 GB of RAM free):
+- **Setup.** Student `outputs/sft-0.8b`, teacher `Qwen/Qwen3.5-4B` (same 248,320-token vocabulary;
+  9.3 GB of weights, not downloaded yet). Prompts: the 84,104 DeepMath rows of `data/rl/pool.parquet`
+  (already decontaminated), minus 8 whose prompt exceeds 1,024 tokens (max 1,782), which would not
+  fit vLLM's 9,216-token window with an 8,192-token completion.
+- **`enable_thinking: true` is required** (`chat_template_kwargs`). TRL renders the chat template
+  itself, and the Base template then writes an empty `<think>\n\n</think>\n\n`. With the flag the
+  prompt tokens equal `render_prompt(..., "think")` (2,000/2,000 checked), and the teacher's own
+  template renders the same prompt. **The think-mode GRPO config (step 7) needs the same setting.**
+- **One rollout = one optimizer step.** TRL's distillation has no `steps_per_generation`: it
+  generates `per_device_train_batch_size x gradient_accumulation_steps` completions and takes one
+  step on them. Config: 1 x 64, lr 5e-6 cosine, 200 steps (12,800 prompts); lr and steps are
+  first guesses.
+- **`TrimmedDistillationTrainer`** (`distill.py`): (1) TRL passes `logits_to_keep` to the backbone,
+  which Qwen3.5's backbone forwards as an unknown keyword to its DeltaNet/attention kernels;
+  dropped, as in GRPO's chunked path. Whether it actually fails with the Hub kernels was not tested.
+  (2) TRL pads the whole rollout to its longest completion before splitting into micro-batches;
+  each micro-batch is trimmed back, so batch size 1 runs unpadded.
+- **To check in the smoke test:** memory (estimate: teacher 9.3 GB + vLLM ~9.8 GB + student during
+  rollouts), time per step, and that rollouts end in `<|im_end|>` (`completions/clipped_ratio`).
+- **Off-GPU review (2026-10-02 23:50).** Checked: config parses; TRL's distillation trainer uses
+  the same `VLLMGeneration` as GRPO, so the text-only and V1-runner workarounds apply (the V1
+  runner env var is set by importing `grpo`); SFT checkpoints save `<|im_end|>` as EOS (the
+  script's assert holds); TRL renders the prompts identically to eval's think prompt (500/500);
+  the subclass's overrides (`model_kwarg_keys`, `_compute_loss`, input keys) match TRL 1.14; the
+  loss is computed per micro-batch with chunked JSD and there is no whole-rollout scoring pass (so
+  GRPO's scoring OOM does not apply). Teacher downloaded. Not checkable without the GPU: memory,
+  the `logits_to_keep` workaround with Hub kernels, step time, rollouts ending on `<|im_end|>`.
+- **Queued chain** (`scripts/run_distill_chain.sh`, own systemd scope): waits for the SFT
+  pipeline, runs 3 steps into `outputs/smoke-distill/`, and starts the full run only if the smoke
+  test exits cleanly, saves a model, logs 3 finite losses and has `clipped_ratio` <= 0.5 in every
+  step. Otherwise it stops and writes the reasons to `outputs/smoke-distill/FAILED`.
+- **Risk: teacher verbosity.** The post-trained Qwen3.5 models think far past 8k tokens (2B: ~12.5k
+  on MATH-500). Matching the 4B's token distributions may pull the student toward longer reasoning
+  and undo part of what SFT taught about finishing within 8k. Watch `completions/mean_length` and
+  `clipped_ratio` during training, and truncation in the eval.
 
 ### Stage 3 (ablation only): DPO, delta-learning style (`scripts/dpo.py`, `scripts/make_dpo_pairs.py`)
 - Chosen = a correct Qwen3.5-9B answer; rejected = the current policy's wrong answer on the
@@ -352,7 +419,7 @@ scripts/
   grpo.py                      # RL-Zero and main-track RL (todo, step 4)
   filter_by_passrate.py        # keep prompts with 0 < pass rate < 1 (todo, step 4)
   build_sft_data.py, sft.py    # (drafted, step 5)
-  distill.py                   # (todo, step 6)
+  distill.py, run_distill.sh   # (drafted, step 6)
   make_dpo_pairs.py, dpo.py    # (todo, step 8)
   smoke_test.sh                # 20 steps of each stage on 0.8B (todo)
 tests/                         # test_rewards.py, test_eval.py (25 passing)

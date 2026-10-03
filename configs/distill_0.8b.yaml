@@ -1,0 +1,65 @@
+# On-policy distillation into the SFT'd Qwen3.5-0.8B from Qwen3.5-4B (thinking), on DeepMath prompts.
+# Recipe: PLAN.md, Stage 2. Run: uv run scripts/distill.py --config configs/distill_0.8b.yaml
+
+# --- script options ---
+model_name_or_path: outputs/sft-0.8b      # student: stage-1 checkpoint
+train_data: data/rl/pool.parquet          # decontaminated RL pool; only the prompts are used
+source: deepmath                          # 84,104 prompts
+max_prompt_tokens: 1024                   # drops 8 very long prompts (max 1,782 tokens)
+
+# --- model loading ---
+# fp32 master weights + bf16 compute (`bf16: true`). With `dtype: bfloat16` the optimizer writes
+# straight into bf16 weights, whose grid (~1/128 relative) is far coarser than an Adam step (~lr):
+# most updates round away (2026-10-03: the first SFT run left ~2/3 of weights unchanged).
+model_init_kwargs:
+  dtype: float32
+  use_kernels: true            # prebuilt Hub kernels for the DeltaNet conv (see check_env.py)
+# Teacher: must share the student's vocabulary (248,320 tokens), so a post-trained Qwen3.5.
+teacher_model_name_or_path: Qwen/Qwen3.5-4B
+teacher_model_init_kwargs:
+  dtype: bfloat16              # ~9.3 GB of weights, frozen, forward passes only
+  use_kernels: true
+bf16: true
+gradient_checkpointing: true
+
+# --- loss ---
+beta: 1.0                      # reverse KL(student || teacher): mode-seeking, standard for on-policy KD
+
+# --- rollouts: one completion per prompt, sampled from the student as RL will sample it ---
+# The Base chat template only opens the think block when asked: without this TRL renders an empty
+# "<think>\n\n</think>\n\n" and the student would be distilled in no-think mode.
+chat_template_kwargs:
+  enable_thinking: true
+max_completion_length: 8192    # the budget 0.8B is SFT-trained, RL-trained and evaluated at
+temperature: 1.0               # also the softmax temperature of the loss: keep at 1.0
+top_p: 1.0
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.30   # as in GRPO
+vllm_enable_sleep_mode: true   # free vLLM memory during the training step
+vllm_max_model_length: 9216    # max_prompt_tokens + max_completion_length
+
+# --- batch: 64 prompts per rollout and per optimizer step, one sequence per forward pass ---
+# TRL generates per_device_train_batch_size x gradient_accumulation_steps completions at once and
+# takes one optimizer step on them. Batch size 1 + distill.py's padding trim = no padding.
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 64
+
+# --- optimizer ---
+optim: adamw_bnb_8bit          # 8-bit Adam states, as in GRPO and SFT
+learning_rate: 5.0e-6          # first guess: half of SFT's peak
+lr_scheduler_type: cosine
+warmup_steps: 10
+weight_decay: 0.0
+max_grad_norm: 1.0
+max_steps: 200                 # 12,800 prompts
+
+# --- logging / saving ---
+output_dir: outputs/distill-0.8b
+logging_steps: 1
+log_completions: true
+num_completions_to_print: 2
+save_steps: 50
+save_total_limit: 4
+report_to: none
+seed: 0

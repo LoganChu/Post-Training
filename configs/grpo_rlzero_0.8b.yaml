@@ -9,8 +9,11 @@ soft_punish_cache: 1024                   # overlong penalty ramps from 3,072 to
 format_reward_weight: 0.1
 
 # --- model loading ---
+# fp32 master weights + bf16 compute (`bf16: true`). With `dtype: bfloat16` the optimizer writes
+# straight into bf16 weights, whose grid (~1/128 relative) is far coarser than an Adam step (~lr):
+# most updates round away (2026-10-03: the first SFT run left ~2/3 of weights unchanged).
 model_init_kwargs:
-  dtype: bfloat16
+  dtype: float32
   use_kernels: true            # prebuilt Hub kernels for the DeltaNet conv (see check_env.py)
 bf16: true
 gradient_checkpointing: true
