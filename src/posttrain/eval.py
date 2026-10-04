@@ -242,7 +242,10 @@ def main() -> None:
     p.add_argument("--top-p", type=float, default=0.95)
     p.add_argument("--top-k", type=int, default=20)
     p.add_argument("--presence-penalty", type=float, default=1.5)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.85)
+    # vLLM claims this fraction of the *whole* GPU. The desktop's own GPU use varies (3.1 GB on
+    # 2026-10-01, 4.3 GB on 2026-10-03, when 0.85 no longer fit and engine startup OOMed); 0.75
+    # leaves headroom and is still far more KV cache than 0.8B-2B models need at 8-32k tokens.
+    p.add_argument("--gpu-memory-utilization", type=float, default=0.75)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output-dir", default=None, help="default: outputs/eval/<model>-<mode>")
     p.add_argument("--regrade", action="store_true", help="re-grade saved samples in --output-dir; no generation")

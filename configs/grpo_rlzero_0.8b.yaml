@@ -1,5 +1,10 @@
 # RL-Zero on Qwen3.5-0.8B-Base: GRPO directly on the Base model with the plain-text "zero" prompt.
 # Recipe: PLAN.md, Stage 4. Run: uv run scripts/grpo.py --config configs/grpo_rlzero_0.8b.yaml
+# The recorded run (2026-10-01/02, outputs/rlzero-0.8b) differed from this file in two ways: it used
+# bf16 weights (dtype was changed to float32 afterwards; bf16 froze most weights) and it was hit by
+# the stop-string issue (finished answers ending on "\nUser:" were masked as truncated; not fixed
+# here). The updates-per-rollout ablation's arm B added: --gradient_accumulation_steps 16
+# --steps_per_generation 64 --max_steps 400 --warmup_steps 40 --save_steps 100. See PLAN.md.
 
 # --- script options ---
 model_name_or_path: Qwen/Qwen3.5-0.8B-Base

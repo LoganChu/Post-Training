@@ -11,12 +11,21 @@ Usage:
   uv run scripts/distill.py --config configs/distill_0.8b.yaml --max_steps 5 --output_dir outputs/smoke-distill   # smoke test
 """
 
+import os
+
+# Reuse freed GPU memory instead of stranding it. The fp32-student smoke test (8-bit teacher)
+# completed step 1, then OOMed in step 2's backward pass needing 2.0 GiB with 3.5 GiB reserved but
+# fragmented (2026-10-03). vLLM's sleep-mode pool handles this setting: it switches it off inside its
+# own allocations and back on afterwards (vllm/device_allocator/cumem.py). Must be set before the
+# CUDA allocator initializes.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 from dataclasses import dataclass, field
 
 import pandas as pd
 import torch
 from datasets import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BitsAndBytesConfig
 from trl import DistillationConfig, DistillationTrainer, TrlParser
 
 # Qwen3.5 workarounds shared with the other stages. Importing grpo also selects vLLM's V1 model
@@ -34,6 +43,9 @@ class ScriptArguments:
     source: str | None = field(default="deepmath", metadata={"help": "keep only this `source` of the pool; None keeps all"})
     max_prompt_tokens: int = field(
         default=1024, metadata={"help": "drop longer prompts; vllm_max_model_length must cover this + max_completion_length"}
+    )
+    teacher_load_in_8bit: bool = field(
+        default=True, metadata={"help": "load the frozen teacher in 8-bit (bitsandbytes) to fit next to an fp32 student"}
     )
 
 
@@ -76,6 +88,14 @@ def main() -> None:
     parser = TrlParser((ScriptArguments, DistillationConfig))
     script_args, training_args = parser.parse_args_and_config()
     assert training_args.teacher_model_name_or_path, "set teacher_model_name_or_path in the config"
+    # With an fp32 student (needed so updates are not rounded away), a bf16 4B teacher no longer fits:
+    # the first fp32 smoke test OOMed in its first backward pass at 29.9 GiB (2026-10-03). The teacher
+    # is frozen and only runs forward passes, so 8-bit weights (~4.8 GB instead of 9.3) cost little.
+    if script_args.teacher_load_in_8bit:
+        training_args.teacher_model_init_kwargs = {
+            **(training_args.teacher_model_init_kwargs or {}),
+            "quantization_config": BitsAndBytesConfig(load_in_8bit=True),
+        }
 
     # Qwen3.5 checkpoints are multimodal: left to itself, TRL loads Qwen3VLProcessor and takes its
     # vision-model code paths. We train text-only, so pass the plain tokenizer (TRL's padding settings).

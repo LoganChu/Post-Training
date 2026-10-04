@@ -6,6 +6,7 @@ model_name_or_path: outputs/sft-0.8b      # student: stage-1 checkpoint
 train_data: data/rl/pool.parquet          # decontaminated RL pool; only the prompts are used
 source: deepmath                          # 84,104 prompts
 max_prompt_tokens: 1024                   # drops 8 very long prompts (max 1,782 tokens)
+teacher_load_in_8bit: true                # bitsandbytes 8-bit teacher: frees ~4.5 GB for the fp32 student
 
 # --- model loading ---
 # fp32 master weights + bf16 compute (`bf16: true`). With `dtype: bfloat16` the optimizer writes

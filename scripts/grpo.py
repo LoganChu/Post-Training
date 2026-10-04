@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 # layers when run in-process the way TRL colocates it ("'NoneType' object has no attribute 'size'"
 # in qwen3_next.forward). The V1 runner works. Must be set before vLLM reads its config.
 os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+# Reuse freed GPU memory instead of stranding it (distillation OOMed on 3.5 GiB of fragmented
+# reserve, 2026-10-03). vLLM's sleep-mode pool switches this off around its own allocations.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import pandas as pd
 import torch
@@ -119,7 +122,7 @@ def main() -> None:
         train_dataset=train,
         processing_class=tokenizer,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model(training_args.output_dir)
 
 

@@ -39,10 +39,10 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 | 2 | Rewards: `src/posttrain/rewards.py` + tests | done |
 | 3 | Eval harness: `src/posttrain/eval.py`, `prompts.py` + tests; stage-0 baselines | done |
 | 4 | **RL-Zero** on 0.8B-Base (GRPO, zero prompt): fastest way to validate the GRPO setup | done 2026-10-02 08:15 (`outputs/rlzero-0.8b/`); results below |
-| 5 | SFT data build (Nemotron) + SFT on 0.8B | first run (bf16 weights) learned almost nothing; v2 (fp32, from Base, <=8k traces) running since 2026-10-03 11:01 (`scripts/run_sft_v2.sh`, log `outputs/sft-v2.log`) |
-| 6 | On-policy distillation on 0.8B | first smoke test (bf16 SFT student) stopped at the gate: 80-91% of rollouts truncated; re-queued after SFT v2 on the better arm |
-| 7 | RL (main track) on 0.8B | todo |
-| 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (queued, `scripts/run_update_ablation.sh`), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation done 2026-10-02 (arm C dropped); rest todo |
+| 5 | SFT data build (Nemotron) + SFT on 0.8B | done 2026-10-03 (`scripts/run_sft.sh`): fp32 SFT on <=8k traces behaves like the Base model; the first (bf16) run learned almost nothing |
+| 6 | On-policy distillation on 0.8B | stopped: student grew longer (97% truncated) and the run OOMed at step 34 (2026-10-03 17:36); no checkpoint |
+| 7 | RL (main track) on 0.8B | done 2026-10-04 08:31 (`outputs/rl-0.8b`): truncation 33% → 5%, half the tokens, accuracy ~unchanged |
+| 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (done; launcher removed, overrides in the `configs/grpo_rlzero_0.8b.yaml` header), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation done 2026-10-02 (arm C dropped); rest todo |
 | 9 | Promote winning configs to 2B (then 4B LoRA if time) | todo |
 
 Every step: small increments, a smoke test (20 steps, peak VRAM logged) before any long run, and
@@ -135,11 +135,51 @@ Separately from the bug, the SFT data leaves little to learn: even in fp32 the r
 ~0.60 early on (0.8B-Base already predicts the teacher at 81% token accuracy), and the teacher's
 "reason as long as needed" style runs past 8k on hard problems. Hence SFT v2's 4k-trace arm.
 
-### SFT v2: fp32, <=8k traces (`scripts/run_sft_v2.sh`, started 2026-10-03 11:01)
+### SFT v2: fp32, <=8k traces (started 2026-10-03 11:01; now `scripts/run_sft.sh`)
 Starts again from `Qwen/Qwen3.5-0.8B-Base` (not from RL-Zero: SFT is the main track's first
 stage), on the 25.7k traces within 8,192 completion tokens, the eval budget every stage shares.
-Then the think-mode eval, then `run_distill_chain.sh` on `outputs/sft-0.8b-8k`. A 4k-trace arm
-(12.2k traces) was started and stopped after a few minutes at the user's request; not run. The distillation gate now only checks that EOS works
+Then the think-mode eval, then the distillation chain (a one-off script, since removed) on `outputs/sft-0.8b-8k`. A 4k-trace arm
+(12.2k traces) was started and stopped after a few minutes at the user's request; not run.
+- **Training done 14:11 (3.1 h, peak 12.7 GiB).** Loss with fp32 weights: 0.604 (steps 1-100),
+  *rising* to 0.634 around the peak lr (steps 200-300), then 0.595 at the end; eval loss 0.6198
+  (step 500) → 0.5916 (final), vs 0.5929 for the bf16 run. So once updates actually apply, lr 1e-5
+  first disrupts the model and the cosine decay recovers it, and the net token-level gain over
+  the Base model is ~nil: these traces sit near the loss floor for 0.8B. Whether SFT changed the
+  *behavior* that matters (finishing within 8k, format) is for the eval to show.
+- **Eval OOM at startup (14:12), not related to the model.** The desktop's GPU use had grown to
+  4.3 GB (one gnome-shell at 2.15 GB; 3.1 GB on 2026-10-01), and vLLM's 85% share no longer fit.
+  `eval.py` now defaults to `--gpu-memory-utilization 0.75`; verified on the fp32 checkpoint
+  (and the fp32 save itself is fine for vLLM). The same squeeze threatens distillation: its smoke
+  test peaked at 26.1 GiB with a bf16 student, and the fp32 student adds ~3 GB.
+- **Eval (think, 8k): unchanged from Base.** MATH-500 48.4 (Base 47.5, bf16 SFT 49.9), AIME
+  2.7/1.2/1.2, AMC 21.9 (24.7), GPQA 10.7 (12.0); truncation MATH 33%, AIME 82-86% (Base 88-90%);
+  MATH format 67%. All within noise. **Conclusion: SFT on these teacher traces does not change
+  0.8B's behavior**, with or without the precision fix: the Base model already writes long
+  chain-of-thought in this style (token accuracy 81% from the start), and the teacher's "reason as
+  long as needed" habit teaches nothing about finishing within 8k. The main track continues with
+  distillation from this checkpoint (effectively the Base model).
+- **Distillation smoke test with the fp32 student OOMed** in its first backward pass (29.9 GiB
+  allocated, 2.1 GiB more needed). Fix: the frozen teacher loads in 8-bit (bitsandbytes,
+  `teacher_load_in_8bit: true`, ~4.8 GB instead of 9.3). Chain relaunched 15:17.
+- That run completed step 1 and OOMed in step 2's backward (2.0 GiB needed, 3.5 GiB reserved but
+  fragmented). Fix: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, set at the top of
+  `distill.py` (vLLM's sleep-mode pool switches it off around its own allocations). **Smoke test
+  passed 15:36:** losses 0.337/0.340/0.335, ~185 s/step, rollouts 6,959-7,671 tokens with 67-89%
+  truncated at 8k; peak allocated reported 33.5 GiB (includes vLLM's pool), i.e. very little
+  headroom. Full run (200 steps x 64 prompts, ~10 h) started 15:36 → `outputs/distill-0.8b/`,
+  then think-mode eval. Watch rollout length / truncation: falling = learning the teacher's
+  reasoning; rising = the teacher's long-thinking style winning.
+- **Full run: student grew longer, then OOMed at step 34 (17:36), no checkpoint saved.** Steps
+  1-20 / 21-33: loss 0.228 / 0.179, rollout length 7,921 / 8,076, truncated 94% / 97%, length of
+  the few finished rollouts ~2.0-2.3k, entropy 0.68 / 0.62. The student matched the teacher
+  better while drifting toward its long-thinking style: at nearly every position of an 8k rollout
+  Qwen3.5-4B (trained to think 10k+ tokens) is still mid-reasoning, so reverse KL teaches "keep
+  going", and with ~3% of rollouts finishing there is almost no signal about concluding. The OOM
+  was a genuine shortage (2.51 GiB needed, 2.35 free, only 0.48 fragmented): full-length 8k
+  sequences need more backward-pass activation memory than early, shorter rollouts. A planned
+  stop-at-step-50 eval could not run. Distillation at an 8k budget from this teacher looks
+  counterproductive for 0.8B; making it work needs both less memory (shorter rollouts / smaller
+  teacher) and a fix for the length drift. The distillation gate now only checks that EOS works
 (`clipped_ratio` <= 0.95 every step): the bf16 SFT student truncated 80-91% of T=1.0 rollouts,
 which is genuine length, not an EOS bug. Memory risk: the earlier smoke test peaked at 26.1 GiB
 with a bf16 student; an fp32 student adds ~3 GB. First (bf16) SFT result for reference, think 8k:
@@ -183,7 +223,7 @@ machine, with ~6 GB of RAM free):
   loss is computed per micro-batch with chunked JSD and there is no whole-rollout scoring pass (so
   GRPO's scoring OOM does not apply). Teacher downloaded. Not checkable without the GPU: memory,
   the `logits_to_keep` workaround with Hub kernels, step time, rollouts ending on `<|im_end|>`.
-- **Queued chain** (`scripts/run_distill_chain.sh`, own systemd scope): waits for the SFT
+- **Queued chain** (a one-off script `run_distill_chain.sh`, removed 2026-10-04; own systemd scope): waits for the SFT
   pipeline, runs 3 steps into `outputs/smoke-distill/`, and starts the full run only if the smoke
   test exits cleanly, saves a model, logs 3 finite losses and has `clipped_ratio` <= 0.5 in every
   step. Otherwise it stops and writes the reasons to `outputs/smoke-distill/FAILED`.
@@ -241,7 +281,7 @@ machine, with ~6 GB of RAM free):
 Smoke test (3 steps): ~230 s/step; correctness reward ~17%, format ~64%, ~37% of rollouts hit the
 4,096-token limit, 0% all-equal-reward groups (the pass-rate filter works), entropy ~1.0.
 
-### Updates-per-rollout ablation (step 8, queued: `scripts/run_update_ablation.sh`)
+### Updates-per-rollout ablation (step 8, done; launcher removed 2026-10-04, arm-B overrides in the `configs/grpo_rlzero_0.8b.yaml` header)
 With one optimizer step per rollout (our default, and the GRPO paper's: "the policy model only has
 a single update following each exploration stage"), the probability ratio is exactly 1, so PPO-style
 clipping, and with it DAPO's clip-higher, never triggers (clip ratio 0 in every logged step). DAPO
@@ -301,6 +341,55 @@ prompts were seen ~3.3 times. MATH-500 +2.4 and GPQA +4.4 are ~1.5x their noise;
 pass@k did not rise (AIME pass@16 fell), consistent with RLVR sharpening existing ability more
 than adding new solutions; entropy is declining steadily and needs watching in longer runs.
 Clipping never triggered (1 update/rollout: ratio exactly 1).
+
+### Main-track RL (step 7, `configs/grpo_main_0.8b.yaml`, started 2026-10-03)
+Distillation was skipped (see Stage 2). GRPO in think mode from the SFT checkpoint (behaves like
+the Base model), with these changes from RL-Zero:
+- **8k completion budget** (RL-Zero: 4k): the student truncates ~33% of MATH-500 answers at 8k
+  and 80%+ of T=1.0 rollouts; at 4k almost nothing would earn reward. Overlong penalty ramps over
+  the last 2,048 tokens.
+- **256 completions per rollout** (16 prompts x 16; RL-Zero: 512): rollouts are ~5x longer.
+- **Micro-batches of 2** (RL-Zero: 8): activation memory at 9k tokens per sequence.
+- **Truncated completions not masked** (RL-Zero: masked): with 80%+ truncated, masking would drop
+  most samples and never penalize running past the budget; unmasked, a truncated rollout gets 0
+  correctness and format and -1 overlong penalty, i.e. a negative advantage.
+- **Same 1,913 prompts as RL-Zero** (pass rate strictly between 0 and 1 for 0.8B-Base): re-scoring
+  at 8k would cost hours, and the comparison with RL-Zero stays direct.
+- fp32 master weights, 4 updates per rollout, `enable_thinking: true`,
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (now also set in `grpo.py`).
+- **Smoke test passed (2026-10-03 20:37-20:56):** 2 rollouts = 17.3 min, i.e. **~8.7 min per
+  rollout** (~5.5 min generation + 4 updates x ~53 s); peak ~23 GB on the GPU. Rollout 1 / 2:
+  correctness 25.8% / 21.9% (RL-Zero started at 17%), format 28.9% / 26.2%, truncated 71% / 74%,
+  mean length 6,736 / 6,629, overlong penalty mean -0.73 / -0.75, 0% all-equal groups; clipping
+  ~0.009% of tokens on updates 2-4.
+
+- **Full run (2026-10-03 23:21 → 10-04 08:31, 100 rollouts, ~5.5 min/rollout on average as
+  rollouts shortened).** Training, rollouts 1-5 → 96-100: correctness reward 21.8% → 60.9%,
+  format 30% → 97%, truncated 70% → 3%, mean length 6,631 → 2,101; entropy steady ~0.75 (no
+  collapse); 0% all-equal groups throughout; 1,600 prompts used, under one pass over 1,913.
+- **Eval (think, 8k):** MATH-500 49.3 (SFT 48.4, Base 47.5), AIME 2.1/0.8/0.0, AMC 23.8, GPQA 26.0
+  (Base 12.0); MATH truncation 5% (33%), format 95% (67%), mean tokens 1,872 (3,842); pass@k
+  unchanged (MATH-500 67.4). Beats the post-trained Qwen3.5-2B at 8k on every benchmark (that model
+  truncates 60% of MATH answers at 8k). **Reading:** RL taught finishing concisely within budget,
+  with no loss of accuracy, but did not raise math accuracy: the problems the model used to
+  truncate on were mostly ones it could not solve. GPQA's jump is mostly from finishing: 26% is at
+  chance for 4-option questions, while the Base model scored below chance because 70% of its
+  answers truncated before a letter. Across stages, only RL changed 0.8B's behavior, and none
+  raised its reasoning accuracy, which points to model capacity (consistent with the budget sweep:
+  extra tokens help 2B, not 0.8B). Next: scale to 2B, whose truncated reasoning is productive.
+
+### TRL truncation check vs stop strings: RL-Zero masked finished answers (found 2026-10-03)
+TRL counts a completion as truncated if its last token is not EOS/pad (`grpo_trainer.py` ~2353,
+2540). vLLM drops a matched stop *string* from the output, so a zero-mode completion that finished
+by reaching `"\nUser:"` ends on an ordinary token and is counted as truncated. Test: 64/64
+zero-mode samples stopped on `"\nUser:"`, none ending in EOS. With RL-Zero's
+`mask_truncated_completions: true`, every such finished answer got no gradient: true truncation
+on its prompts was 16.4% vs TRL's `clipped_ratio` 36-38% at the start, so ~20% of all RL-Zero
+completions (complete answers, many correct) were silently excluded. Think mode is unaffected:
+completions end on `<|im_end|>`, which is the SFT tokenizer's EOS and kept in the output (64/64
+counted correctly), so the main track's `clipped_ratio` is real truncation. Fix needed before
+re-running RL-Zero: e.g. count `finish_reason == "stop"` as finished, or drop `"\nUser:"` as a
+stop string and handle extra turns in the reward.
 
 ### RL-Zero track (step 4, also an ablation)
 - Same stage-4 recipe on the Base model with the plain-text `zero` prompt, and
@@ -404,25 +493,32 @@ uv run -m posttrain.eval --model outputs/<checkpoint> --mode think --benchmarks 
 ## Repo layout
 
 ```
-pyproject.toml                 # uv project (done)
-PLAN.md                        # this file
+pyproject.toml, uv.lock        # uv project
+PLAN.md, README.md             # plan/findings, results
 src/posttrain/
-  prompts.py                   # think / zero prompt templates + stop strings (done)
-  rewards.py                   # correctness, format, overlong penalty (done)
-  eval.py                      # vLLM eval, --regrade (done)
-  data.py                      # RL pool, decontamination, GRPO / SFT dataset formats (done)
-configs/                       # one YAML per stage x model size, TrlParser format (todo)
+  prompts.py                   # think / zero prompt templates + stop strings
+  rewards.py                   # correctness, format, overlong penalty (training and eval)
+  eval.py                      # vLLM eval, --regrade
+  data.py                      # RL pool, decontamination, GRPO / SFT dataset formats
+configs/                       # TrlParser YAMLs (script options + trainer config)
+  sft_0.8b.yaml                # SFT, fp32 weights, traces <= 8k
+  grpo_rlzero_0.8b.yaml        # RL-Zero (header notes how the recorded run differed)
+  grpo_main_0.8b.yaml          # main-track RL, think mode, 8k
+  distill_0.8b.yaml            # on-policy distillation (tried, stopped)
 scripts/
-  check_env.py                 # environment + kernel check (done)
-  run_baselines.sh             # stage-0 evals, resumable (done)
-  run_followups.sh             # 8k ceiling + output-budget sweep (done)
-  grpo.py                      # RL-Zero and main-track RL (todo, step 4)
-  filter_by_passrate.py        # keep prompts with 0 < pass rate < 1 (todo, step 4)
-  build_sft_data.py, sft.py    # (drafted, step 5)
-  distill.py, run_distill.sh   # (drafted, step 6)
-  make_dpo_pairs.py, dpo.py    # (todo, step 8)
-  smoke_test.sh                # 20 steps of each stage on 0.8B (todo)
-tests/                         # test_rewards.py, test_eval.py (25 passing)
+  check_env.py                 # environment + kernel check
+  run_baselines.sh             # stage-0 evals (resumable)
+  run_followups.sh             # 8k ceiling + output-budget sweep
+  build_sft_data.py, sft.py    # SFT data + trainer
+  run_sft.sh                   # build -> SFT -> eval
+  filter_by_passrate.py        # RL prompts with pass rate strictly between 0 and 1
+  grpo.py                      # GRPO for both tracks (Qwen3.5 / TRL workarounds)
+  run_rl_main.sh               # main-track RL -> eval (resumable from checkpoints)
+  distill.py, run_distill.sh   # on-policy distillation (tried, stopped)
+tests/                         # test_rewards.py, test_eval.py, test_data.py
+data/rl/                       # pool.parquet, rlzero-0.8b(-scored).parquet
+data/sft/                      # nemotron-{train,val}.parquet
+outputs/                       # final models, evals (outputs/eval/), logs; not in git
 ```
 
 ## Risks / open points
@@ -442,3 +538,8 @@ tests/                         # test_rewards.py, test_eval.py (25 passing)
   deleted; their numbers are kept in the protocol section above.
 - 2026-10-01: stage-0 complete; eval changes and scripts committed (`a568fa3`); results added to
   README.md.
+- 2026-10-04: cleanup. Removed one-off launchers (`run_sft_v2.sh`, merged into `run_sft.sh`;
+  `run_distill_chain.sh`, `run_distill_step50_eval.sh`, `run_update_ablation.sh`) and
+  `data/sft-smoke/`. Deleted ~102 GB of intermediate checkpoints (optimizer states) and
+  smoke/debug model files; kept every run's final model, all evals and all logs. The bf16 SFT
+  model (effectively Base) was deleted; its log and eval remain.

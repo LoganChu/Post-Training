@@ -13,6 +13,21 @@ uv run scripts/check_env.py --use-kernels   # GPU, versions, fast DeltaNet kerne
 uv run --group dev pytest tests              # reward + eval unit tests
 ```
 
+## Reproduce
+
+Each launcher is resumable (finished stages are skipped) and logs to `outputs/`:
+
+```
+scripts/run_baselines.sh                     # stage-0 evals (Base models, post-trained 2B)
+scripts/run_followups.sh                     # 8k ceiling + output-budget sweep
+uv run -m posttrain.data build               # RL prompt pool -> data/rl/pool.parquet
+uv run scripts/filter_by_passrate.py --model Qwen/Qwen3.5-0.8B-Base --mode zero --name rlzero-0.8b --n-prompts 6000
+uv run scripts/grpo.py --config configs/grpo_rlzero_0.8b.yaml   # RL-Zero (see the config header)
+scripts/run_sft.sh                           # SFT data build -> SFT -> eval
+scripts/run_rl_main.sh                       # main-track RL from the SFT model -> eval
+scripts/run_distill.sh                       # on-policy distillation (tried, stopped; see PLAN.md)
+```
+
 ## Evaluation
 
 ```
@@ -59,3 +74,17 @@ MATH-500 = first 100 problems (k=4); AIME 2025 k=16.
 
 2B-Base turns extra tokens into AIME accuracy; 0.8B-Base mostly does not (truncation falls,
 accuracy stays flat).
+
+### Main track on Qwen3.5-0.8B (think mode, 8k, avg@k %)
+
+| Stage | MATH-500 | AIME24 | AIME25 | AIME26 | AMC23 | GPQA-D | MATH truncated | MATH tokens |
+|---|---|---|---|---|---|---|---|---|
+| Base | 47.5 | 1.7 | 1.0 | 0.8 | 24.7 | 12.0 | 33% | 3,810 |
+| SFT (Nemotron traces <= 8k, fp32) | 48.4 | 2.7 | 1.2 | 1.2 | 21.9 | 10.7 | 33% | 3,842 |
+| SFT + RL (GRPO, 100 rollouts) | 49.3 | 2.1 | 0.8 | 0.0 | 23.8 | 26.0 | 5% | 1,872 |
+
+On-policy distillation from Qwen3.5-4B was tried and stopped (the student drifted toward the
+teacher's long reasoning; see PLAN.md). RL taught the model to finish within budget (truncation
+33% → 5%, half the tokens) without changing math accuracy; GPQA's rise is mostly from answers now
+finishing (26% is chance level for 4 options).
+

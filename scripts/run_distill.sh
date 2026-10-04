@@ -3,6 +3,8 @@
 #   1. distill $STUDENT (default outputs/sft-0.8b-8k) against Qwen3.5-4B with configs/distill_0.8b.yaml
 #   2. standard think-mode eval at 8k (compare: the SFT row)
 # Resumable: finished stages are skipped. Run the smoke test in scripts/distill.py first.
+# Status (2026-10-03): stopped. At an 8k budget the student drifted toward the teacher's long
+# reasoning (97% of rollouts truncated) and the run OOMed at step 34; see PLAN.md, Stage 2.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 log() { echo "[$(date '+%m-%d %H:%M')] $*"; }

@@ -1,0 +1,76 @@
+# Main-track RL on the SFT'd Qwen3.5-0.8B: GRPO in think mode (chat template, <think> block).
+# Recipe: PLAN.md, Stage 4 (step 7). Run: uv run scripts/grpo.py --config configs/grpo_main_0.8b.yaml
+# Differences from RL-Zero (configs/grpo_rlzero_0.8b.yaml), and why:
+#   - think mode at an 8k budget: the student truncates ~33% of MATH-500 answers even at 8k and 80%+
+#     of T=1.0 rollouts, so RL-Zero's 4k limit would leave almost no reward signal;
+#   - 256 completions per rollout (16 prompts x 16) instead of 512: rollouts are ~5x longer;
+#   - micro-batches of 2: 8 sequences x 9k tokens would not fit in activation memory;
+#   - truncated completions are NOT masked (see below);
+#   - fp32 master weights and 4 updates per rollout (precision fix; updates-per-rollout ablation).
+
+# --- script options ---
+model_name_or_path: outputs/sft-0.8b-8k
+mode: think
+# RL-Zero's prompts (pass rate strictly between 0 and 1 for 0.8B-Base, which the SFT student
+# behaves like). Re-scoring at 8k tokens would cost hours; same prompts also make the comparison
+# with RL-Zero direct.
+train_data: data/rl/rlzero-0.8b.parquet
+soft_punish_cache: 2048                   # overlong penalty ramps from 6,144 to 8,192 tokens
+format_reward_weight: 0.1
+
+# --- model loading ---
+# fp32 master weights + bf16 compute (`bf16: true`); bf16 weights round Adam steps away.
+model_init_kwargs:
+  dtype: float32
+  use_kernels: true
+bf16: true
+gradient_checkpointing: true
+use_liger_kernel: true         # chunked log-probs (full 248k-vocab logits OOM)
+
+# --- GRPO loss ---
+loss_type: dapo
+epsilon: 0.2
+epsilon_high: 0.28
+beta: 0.0
+scale_rewards: batch
+# Not masked, unlike RL-Zero: with 80%+ of rollouts truncated, masking would drop most samples and
+# never penalize running past the budget, the behavior this stage must change. Unmasked, a truncated
+# rollout scores 0 (correctness, format) and -1 (overlong penalty), so its advantage is negative.
+mask_truncated_completions: false
+
+# --- rollouts ---
+chat_template_kwargs:
+  enable_thinking: true        # else TRL renders an empty <think></think> block
+num_generations: 16
+max_completion_length: 8192
+temperature: 1.0
+top_p: 1.0
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.30
+vllm_enable_sleep_mode: true
+vllm_max_model_length: 9216    # prompt (<= 1,024) + completion
+
+# --- batch: 256 completions per rollout = 128 micro-batches of 2; 4 updates of 32 micro-batches ---
+per_device_train_batch_size: 2
+steps_per_generation: 128
+gradient_accumulation_steps: 32
+num_iterations: 1
+
+# --- optimizer ---
+optim: adamw_bnb_8bit
+learning_rate: 1.0e-6
+lr_scheduler_type: constant_with_warmup
+warmup_steps: 40               # 10 rollouts
+max_grad_norm: 1.0
+max_steps: 400                 # 100 rollouts; revisit after the smoke test's step time
+
+# --- logging / saving ---
+output_dir: outputs/rl-0.8b
+logging_steps: 1
+log_completions: true
+num_completions_to_print: 2
+save_steps: 40                 # every 10 rollouts
+save_total_limit: 4
+report_to: none
+seed: 0
