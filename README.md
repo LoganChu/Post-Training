@@ -25,6 +25,7 @@ uv run scripts/filter_by_passrate.py --model Qwen/Qwen3.5-0.8B-Base --mode zero 
 uv run scripts/grpo.py --config configs/grpo_rlzero_0.8b.yaml   # RL-Zero (see the config header)
 scripts/run_sft.sh                           # SFT data build -> SFT -> eval
 scripts/run_rl_main.sh                       # main-track RL from the SFT model -> eval
+scripts/run_rl_2b.sh                         # 2B (LoRA): score prompts -> smoke test -> RL -> eval
 scripts/run_distill.sh                       # on-policy distillation (tried, stopped; see PLAN.md)
 ```
 

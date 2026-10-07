@@ -1,0 +1,84 @@
+# Main-track RL on Qwen3.5-2B-Base: the same GRPO recipe as configs/grpo_main_0.8b.yaml (think mode,
+# 8k budget, 16 prompts x 16, truncation penalized), with LoRA and 8 updates per rollout.
+# Run: CONFIG=configs/grpo_main_2b.yaml NAME=rl-2b BASE_REPO=Qwen/Qwen3.5-2B-Base scripts/run_rl_main.sh
+# Differences from 0.8B, and why:
+#   - starts from the Base model: SFT on these traces left 0.8B unchanged (PLAN.md, Stage 1);
+#   - LoRA instead of full fine-tuning: fp32 master weights + grads + Adam for 2B (~20 GB) do not fit
+#     next to vLLM; LoRA on all linear layers matches full fine-tuning in RL ("LoRA Without Regret",
+#     Thinking Machines 2025). The frozen base can stay bf16 (it is never updated; adapters are fp32),
+#     and grpo.py syncs W + delta-W to vLLM without TRL's in-place merge/unmerge (which would round
+#     the bf16 base on every sync, once per rollout);
+#   - lr 10x the full fine-tuning one (their finding for LoRA);
+#   - prompts re-scored for 2B (0.8B's set would be largely too easy);
+#   - 8 updates per rollout of 32 completions (0.8B: 4 of 64): LoRA is less tolerant of large batches
+#     (LoRA Without Regret / TRL guide: effective batch < 32).
+
+# --- script options ---
+model_name_or_path: Qwen/Qwen3.5-2B-Base
+mode: think
+train_data: data/rl/rl-2b.parquet         # 2B pass rate strictly between 0 and 1 (think mode, 8k)
+soft_punish_cache: 2048                   # overlong penalty ramps from 6,144 to 8,192 tokens
+format_reward_weight: 0.1
+use_lora: true
+lora_r: 32
+lora_alpha: 32                            # scale 1.0; all language-model linear layers (186), 33.6M params
+
+# --- model loading ---
+model_init_kwargs:
+  dtype: bfloat16              # frozen base; adapters are created in fp32 (PEFT autocast_adapter_dtype)
+  use_kernels: true
+bf16: true
+gradient_checkpointing: true
+use_liger_kernel: true         # chunked log-probs (full 248k-vocab logits OOM)
+
+# --- GRPO loss (as 0.8B) ---
+loss_type: dapo
+epsilon: 0.2
+epsilon_high: 0.28
+beta: 0.0
+scale_rewards: batch
+mask_truncated_completions: false   # truncated rollouts: 0 correctness/format, -1 overlong penalty
+# Per-token truncated importance sampling for the vLLM/trainer mismatch, instead of TRL's default
+# sequence_mask. sequence_mask weights each completion by exp(sum of per-token logp gaps): over 5-7k
+# tokens the bf16 noise (mean gap ~0.012/token) sums to weights >> 3 (dropped) or << 1 (near zero),
+# leaving a mean weight of 0.24-0.37 (0.8B main track; 2B smoke) vs ~0.88 for 1.4k-token RL-Zero.
+# token_truncate caps each token's ratio at 3 (vllm_importance_sampling_clip_max), so noise does not
+# accumulate along the sequence. (The 0.8B main-track run used sequence_mask.)
+vllm_importance_sampling_mode: token_truncate
+
+# --- rollouts (as 0.8B) ---
+chat_template_kwargs:
+  enable_thinking: true
+num_generations: 16
+max_completion_length: 8192
+temperature: 1.0
+top_p: 1.0
+use_vllm: true
+vllm_mode: colocate
+vllm_gpu_memory_utilization: 0.30   # bf16 2B weights ~4.3 GB + KV cache
+vllm_enable_sleep_mode: true
+vllm_max_model_length: 9216
+
+# --- batch: 256 completions per rollout = 128 micro-batches of 2; 8 updates of 16 micro-batches (32 completions) ---
+per_device_train_batch_size: 2
+steps_per_generation: 128
+gradient_accumulation_steps: 16
+num_iterations: 1
+
+# --- optimizer ---
+optim: adamw_torch_fused       # only the 33.6M adapter params are optimized: fp32 Adam is cheap
+learning_rate: 1.0e-5          # 10x the full fine-tuning lr (1e-6), per LoRA Without Regret
+lr_scheduler_type: constant_with_warmup
+warmup_steps: 80               # 10 rollouts
+max_grad_norm: 1.0
+max_steps: 800                 # 100 rollouts
+
+# --- logging / saving ---
+output_dir: outputs/rl-2b
+logging_steps: 1
+log_completions: true
+num_completions_to_print: 2
+save_steps: 80                 # every 10 rollouts (adapter checkpoints are small)
+save_total_limit: 4
+report_to: none
+seed: 0

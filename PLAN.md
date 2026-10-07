@@ -43,7 +43,7 @@ only an ablation here: for a math-only pipeline it is the most optional stage.
 | 6 | On-policy distillation on 0.8B | stopped: student grew longer (97% truncated) and the run OOMed at step 34 (2026-10-03 17:36); no checkpoint |
 | 7 | RL (main track) on 0.8B | done 2026-10-04 08:31 (`outputs/rl-0.8b`): truncation 33% → 5%, half the tokens, accuracy ~unchanged |
 | 8 | Ablations on 0.8B: **updates per rollout / clip-higher** (done; launcher removed, overrides in the `configs/grpo_rlzero_0.8b.yaml` header), +DPO, SFT-only vs SFT+distill, RL loss grid | updates ablation done 2026-10-02 (arm C dropped); rest todo |
-| 9 | Promote winning configs to 2B (then 4B LoRA if time) | todo |
+| 9 | Main-track RL on 2B (LoRA) | prompts scored (1,565 kept) and smoke test passed 2026-10-04; full run stopped at step 8 (19:30) to switch to token-level IS; not restarted |
 
 Every step: small increments, a smoke test (20 steps, peak VRAM logged) before any long run, and
 an eval with the same protocol as the baselines afterwards.
@@ -378,6 +378,49 @@ the Base model), with these changes from RL-Zero:
   raised its reasoning accuracy, which points to model capacity (consistent with the budget sweep:
   extra tokens help 2B, not 0.8B). Next: scale to 2B, whose truncated reasoning is productive.
 
+### Main-track RL on 2B (step 9, prepared 2026-10-04, `configs/grpo_main_2b.yaml`)
+Same recipe as 0.8B (think mode, 8k, 16 prompts x 16, truncation penalized, DAPO loss), with these
+changes:
+- **8 updates per rollout of 32 completions** (0.8B: 4 of 64): LoRA is less tolerant of large
+  batches (TRL's LoRA Without Regret guide: effective batch < 32). 100 rollouts = 800 optimizer
+  steps; warmup 80 and checkpoints every 80 steps (10 rollouts each).
+- **From Qwen3.5-2B-Base**, no SFT (SFT left 0.8B unchanged).
+- **LoRA r=32, alpha=32 on all 186 language-model linear layers** (attention q/k/v/o, DeltaNet
+  in_proj_qkv/z/a/b and out_proj, MLP gate/up/down; not vision, not lm_head): 33.6M trainable
+  params in fp32 on a frozen bf16 base. Full fine-tuning with fp32 master weights (~20 GB of
+  weights/grads/Adam) does not fit next to vLLM. LoRA on all layers matches full fine-tuning in RL
+  ("LoRA Without Regret", Thinking Machines 2025); lr 1e-5 = 10x the full-fine-tuning lr, per the
+  same work. fp32 Adam (`adamw_torch_fused`) since only the adapters are optimized.
+- **Non-destructive LoRA weight sync** (`lora_safe_weight_sync` in `grpo.py`): TRL merges adapters
+  into the base weights in place and unmerges after each vLLM sync, which with a bf16 base rounds
+  the base on every sync (once per rollout, 100 times per run). The override yields W + delta-W per layer computed in
+  fp32 and rounded once, never touching the base. Tested on the real 2B (CPU): 186 LoRA layers,
+  none in vision/lm_head; after a sync with non-zero adapters the base is bit-identical and each
+  synced weight equals W + delta-W. At the end, the adapter is saved to `outputs/rl-2b/adapter` and
+  the merged model to `outputs/rl-2b`.
+- **Prompts re-scored for 2B** (think mode, 8k, k=8, 3,000 prompts → `data/rl/rl-2b.parquet`): the
+  0.8B set would be largely too easy for 2B (no gradient from all-correct groups).
+- Not yet verified on the GPU: memory, the LoRA sync with vLLM, step time (rough guess ~2x 0.8B).
+
+- **Prompt scoring (15:09-18:43):** 2B-Base think mode at 8k on 3,000 prompts: pass rate 0 for
+  38.8%, 1-3/8 26.4%, 4-7/8 25.7%, 8/8 9.1%; mean 33.1%, 53.9% truncated, mean 6,007 tokens. Kept
+  1,565 (1,366 DeepMath, 199 DAPO) → `data/rl/rl-2b.parquet`.
+- **Smoke test passed (18:43-19:08):** rollouts 1/2: correctness 52.7% / 39.5%, truncated 30% /
+  48%, length 4,775 / 6,002, entropy 0.75 / 0.86, 0% all-equal groups. ~387-401 s generation + 7
+  updates x ~39.5 s ≈ **11 min per rollout**. LoRA weight sync verified: the vLLM-vs-trainer log-prob
+  gap is the same before and after the 8 updates (mean 0.0117 at both rollouts), so vLLM generates
+  from the updated weights.
+- **Importance-sampling finding → switched to `token_truncate`.** TRL's default `sequence_mask`
+  weights each completion by exp(sum of per-token log-prob gaps vLLM vs trainer) and drops weights
+  above 3; there is no lower bound. Over 5-7k tokens the bf16 noise sums to weights far above 3
+  (dropped) or far below 1 (near zero): mean weight 0.24-0.33 in the 0.8B main-track run and
+  0.30-0.37 in the 2B smoke test, vs 0.86-0.92 for RL-Zero's ~1.4k-token completions. So the 0.8B
+  main track trained on roughly a quarter to a third of its effective sample weight (it still
+  worked). `token_truncate` caps each token's ratio at 3 instead (truncated IS, Yao et al. 2025;
+  standard for long CoT in verl). The first full 2B run was stopped at step 8 and moved to
+  `outputs/rl-2b-aborted-seqmask/`; the config now sets `vllm_importance_sampling_mode:
+  token_truncate`. Restart: `scripts/run_rl_2b.sh` (skips the finished scoring and smoke test).
+
 ### TRL truncation check vs stop strings: RL-Zero masked finished answers (found 2026-10-03)
 TRL counts a completion as truncated if its last token is not EOS/pad (`grpo_trainer.py` ~2353,
 2540). vLLM drops a matched stop *string* from the output, so a zero-mode completion that finished
@@ -504,6 +547,7 @@ configs/                       # TrlParser YAMLs (script options + trainer confi
   sft_0.8b.yaml                # SFT, fp32 weights, traces <= 8k
   grpo_rlzero_0.8b.yaml        # RL-Zero (header notes how the recorded run differed)
   grpo_main_0.8b.yaml          # main-track RL, think mode, 8k
+  grpo_main_2b.yaml            # main-track RL on 2B with LoRA
   distill_0.8b.yaml            # on-policy distillation (tried, stopped)
 scripts/
   check_env.py                 # environment + kernel check
@@ -513,7 +557,8 @@ scripts/
   run_sft.sh                   # build -> SFT -> eval
   filter_by_passrate.py        # RL prompts with pass rate strictly between 0 and 1
   grpo.py                      # GRPO for both tracks (Qwen3.5 / TRL workarounds)
-  run_rl_main.sh               # main-track RL -> eval (resumable from checkpoints)
+  run_rl_main.sh               # main-track RL -> eval (resumable; CONFIG/NAME/BASE_REPO select the size)
+  run_rl_2b.sh                 # 2B: score prompts -> gated smoke test -> run_rl_main.sh
   distill.py, run_distill.sh   # on-policy distillation (tried, stopped)
 tests/                         # test_rewards.py, test_eval.py, test_data.py
 data/rl/                       # pool.parquet, rlzero-0.8b(-scored).parquet
