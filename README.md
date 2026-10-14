@@ -89,3 +89,27 @@ teacher's long reasoning; see PLAN.md). RL taught the model to finish within bud
 33% → 5%, half the tokens) without changing math accuracy; GPQA's rise is mostly from answers now
 finishing (26% is chance level for 4 options).
 
+### Main track on Qwen3.5-2B (think mode, 8k)
+
+RL directly from Base (SFT left 0.8B unchanged), LoRA r=32 on all language-model linear layers,
+100 rollouts of 16 prompts × 16, 8 updates per rollout, per-token truncated importance sampling
+(`configs/grpo_main_2b.yaml`). About 14.5 h of training.
+
+| Stage | MATH-500 | AIME24 | AIME25 | AIME26 | AMC23 | GPQA-D | MATH truncated | MATH tokens |
+|---|---|---|---|---|---|---|---|---|
+| Base, avg@k | 72.2 | 13.5 | 12.3 | 10.6 | 46.2 | 24.5 | 21% | 3,021 |
+| Base + RL, avg@k | **79.8** | **24.2** | **20.0** | **21.9** | **63.7** | **39.8** | 5% | 1,729 |
+| Base, pass@k | 84.0 | 30.0 | 30.0 | 30.0 | 70.0 | 44.4 | | |
+| Base + RL, pass@k | 92.0 | 63.3 | 46.7 | 56.7 | 90.0 | 61.1 | | |
+
+Unlike 0.8B, RL improved accuracy on every benchmark, pass@k included, so more problems get
+solved within 8k (not just more reliably). AIME truncation fell from 80-85% to 35-42%. Training
+reward ran in two phases: rollouts 1-40 mostly taught the model to finish (mean length 4.8k → 2.4k,
+truncation 30% → 4%, correctness 0.53 → 0.70); over rollouts 40-100 length stayed flat while
+correctness kept rising (0.70 → 0.81). At 8k the RL model also scores above Qwen's post-trained 2B
+evaluated at 32k (stage-0 table; reduced k there).
+
+The gain over 0.8B cannot be attributed to a single change: model size, starting from Base, LoRA,
+8 updates per rollout, and the importance-sampling mode (`token_truncate` vs TRL's default
+`sequence_mask`, which left a mean weight of ~0.3 on 5-7k-token completions) all differ.
+
